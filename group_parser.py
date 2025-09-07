@@ -6,7 +6,6 @@ from dotenv import load_dotenv
 # Завантажуємо змінні з .env файлу
 load_dotenv()
 
-# API дані з .env файлу
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 
@@ -16,48 +15,48 @@ print(f"🔍 API_HASH: {'*' * len(API_HASH) if API_HASH else 'НЕ ВСТАНО�
 
 if not API_ID or not API_HASH:
     print("❌ Помилка: API_ID або API_HASH не встановлено!")
-    print("Створіть .env файл з правильними даними:")
     exit(1)
 
-client = TelegramClient("session", API_ID, API_HASH)
+# Запитуємо номер телефону
+phone_number = input("📱 Введіть номер телефону (у форматі +380...): ").strip()
+
+# Ім'я файлу сесії = номеру телефону
+session_name = f"session_{phone_number}"
+
+# Створюємо клієнт
+client = TelegramClient(session_name, API_ID, API_HASH)
 
 async def main():
+    # Авторизація (використовує існуючу сесію, або попросить код тільки перший раз)
+    await client.start(phone_number)
+
     dialogs = await client.get_dialogs()
     group_data = []
 
     for dialog in dialogs:
         entity = dialog.entity
-        if isinstance(entity, (Channel, Chat)):  
-            # Отримуємо ID групи
+        if isinstance(entity, (Channel, Chat)):
             group_id = str(entity.id)
-            
-            # Отримуємо username якщо є
             username = getattr(entity, 'username', None)
-            
-            # Отримуємо назву групи
             title = getattr(entity, 'title', f'Група {group_id}')
-            
-            # Формуємо дані групи
+
             group_info = {
                 'id': group_id,
                 'title': title,
                 'username': username,
                 'link': None
             }
-            
-            # Створюємо посилання
+
             if username:
                 group_info['link'] = f"https://t.me/{username}"
             else:
-                # Для груп без username використовуємо ID
                 group_info['link'] = f"ID: {group_id}"
-            
+
             group_data.append(group_info)
 
-    # Виводимо результати
     print("📋 Список груп:")
     print("=" * 80)
-    
+
     for i, group in enumerate(group_data, 1):
         print(f"{i}. {group['title']}")
         print(f"   ID: {group['id']}")
@@ -67,65 +66,34 @@ async def main():
         else:
             print(f"   Посилання: {group['link']}")
         print()
-    
-    # Виводимо тільки ID через кому
-    group_ids = [group['id'] for group in group_data]
-    ids_result = ",".join(group_ids)
+
+    # ID через кому
+    ids_result = ",".join([group['id'] for group in group_data])
     print("🔢 ID груп через кому:")
     print(ids_result)
     print()
-    
-    # Виводимо username через кому
-    usernames = []
-    for group in group_data:
-        if group['username']:
-            usernames.append(f"@{group['username']}")
-        else:
-            usernames.append(f"ID:{group['id']}")
-    
+
+    # Usernames через кому
+    usernames = [f"@{g['username']}" if g['username'] else f"ID:{g['id']}" for g in group_data]
     usernames_result = ",".join(usernames)
     print("👤 Username через кому:")
     print(usernames_result)
     print()
-    
-    # Виводимо посилання через кому
-    links = []
-    for group in group_data:
-        if group['username']:
-            links.append(group['link'])
-        else:
-            links.append(f"ID:{group['id']}")
-    
+
+    # Посилання через кому
+    links = [g['link'] for g in group_data]
     links_result = ",".join(links)
     print("🔗 Посилання через кому:")
     print(links_result)
     print()
-    
-    # Виводимо змішаний формат (ID, username та посилання)
-    mixed = []
-    for group in group_data:
-        if group['username']:
-            mixed.append(f"@{group['username']}")
-        else:
-            mixed.append(group['id'])
-    
+
+    # Змішаний формат
+    mixed = [f"@{g['username']}" if g['username'] else g['id'] for g in group_data]
     mixed_result = ",".join(mixed)
     print("🎯 Змішаний формат (ID та username):")
     print(mixed_result)
     print()
-    
-    # Виводимо всі формати разом
-    all_formats = []
-    for group in group_data:
-        if group['username']:
-            all_formats.append(f"@{group['username']}")
-        else:
-            all_formats.append(group['id'])
-    
-    all_formats_result = ",".join(all_formats)
-    print("🌟 Всі формати разом (ID та @username):")
-    print(all_formats_result)
-    
+
     return {
         'ids': ids_result,
         'links': links_result,
