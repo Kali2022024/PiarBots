@@ -48,12 +48,10 @@ init_broadcast_module(db)
 init_mass_broadcast_module(db, bot)
 init_join_groups_module(db)
 
-# Глобальні змінні для стикерів (можна налаштувати)
-RANDOM_STICKERS = []
 
 # Імпортуємо RANDOM_STICKERS в database модуль
 import database
-database.RANDOM_STICKERS = RANDOM_STICKERS
+RANDOM_STICKERS = database.RANDOM_STICKERS
 
 @router.message(Command("start"))
 async def cmd_start(message: Message):

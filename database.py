@@ -411,9 +411,54 @@ class Database:
         for attempt in range(max_retries):
             try:
                 # Перевіряємо, чи існує група
+                entity = None
                 try:
-                    entity = await client.get_entity(int(group_id))
-                    logger.info(f"✅ Група {group_name} ({group_id}) знайдена, відправляємо повідомлення...")
+                    logger.info(f"🔍 Шукаємо групу з ID: {group_id} (тип: {type(group_id)})")
+                    
+                    # Спробуємо різні формати ID
+                    id_variants = [
+                        int(group_id),  # Оригінальний ID
+                        int(group_id.replace('-100', '')),  # Без префіксу -100
+                        int(group_id.replace('-100', '100')),  # Заміна -100 на 100
+                    ]
+                    
+                    # Додаємо спробу з username, якщо він є
+                    if hasattr(self, 'get_group_username') and group_name:
+                        try:
+                            username = self.get_group_username(group_id)
+                            if username:
+                                id_variants.append(username)
+                        except:
+                            pass
+                    
+                    for variant_id in id_variants:
+                        try:
+                            logger.info(f"🔍 Спробуємо ID: {variant_id}")
+                            entity = await client.get_entity(variant_id)
+                            logger.info(f"✅ Група {group_name} знайдена з ID: {variant_id}")
+                            break
+                        except Exception as variant_error:
+                            logger.info(f"❌ ID {variant_id} не працює: {variant_error}")
+                            continue
+                    
+                    if entity is None:
+                        # Спробуємо знайти групу через діалоги
+                        try:
+                            logger.info(f"🔍 Шукаємо групу {group_name} через діалоги...")
+                            dialogs = await client.get_dialogs()
+                            for dialog in dialogs:
+                                if dialog.is_group or dialog.is_channel:
+                                    if str(dialog.id) == str(group_id) or str(dialog.id) == str(group_id).replace('-100', ''):
+                                        entity = dialog.entity
+                                        logger.info(f"✅ Група {group_name} знайдена через діалоги з ID: {dialog.id}")
+                                        break
+                        except Exception as dialog_error:
+                            logger.info(f"❌ Помилка при пошуку через діалоги: {dialog_error}")
+                        
+                        if entity is None:
+                            logger.warning(f"⚠️ Група {group_name} ({group_id}) не знайдена з жодним варіантом ID")
+                            return False
+                        
                 except Exception as e:
                     logger.warning(f"⚠️ Група {group_name} ({group_id}) не знайдена: {e}")
                     return False

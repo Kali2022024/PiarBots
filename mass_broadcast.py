@@ -689,11 +689,40 @@ async def process_mass_interval_callback(callback: CallbackQuery, state: FSMCont
         try:
             interval = int(interval_text)
             await state.update_data(interval=interval, use_random=False)
+            logger.info(f"💾 Збережено фіксований інтервал між аккаунтами: {interval} сек")
+            
+            # Перевіряємо чи дані збереглися
+            data_check = await state.get_data()
+            logger.info(f"🔍 Перевірка збереження: interval={data_check.get('interval')}, use_random={data_check.get('use_random')}")
+            
             await show_package_selection(callback, state)
         except ValueError:
             await callback.message.answer("❌ Невірний інтервал. Спробуйте ще раз.")
     
     await callback.answer()
+
+@router.message(MassBroadcastStates.waiting_for_interval)
+async def process_custom_interval(message: Message, state: FSMContext):
+    """Обробка введення власного інтервалу (використовує існуючу логіку)"""
+    try:
+        interval = int(message.text.strip())
+        
+        if interval < 10 or interval > 86400:
+            await message.answer("❌ Інтервал повинен бути від 10 до 86400 секунд.")
+            return
+        
+        await state.update_data(interval=interval, use_random=False)
+        logger.info(f"💾 Збережено власний інтервал між аккаунтами: {interval} сек")
+        
+        # Перевіряємо чи дані збереглися
+        data_check = await state.get_data()
+        logger.info(f"🔍 Перевірка збереження: interval={data_check.get('interval')}, use_random={data_check.get('use_random')}")
+        
+        await message.answer(f"✅ Встановлено інтервал: {interval} секунд")
+        await show_package_selection(message, state)
+        
+    except ValueError:
+        await message.answer("❌ Неправильний формат. Введіть число від 10 до 86400.")
 
 @router.callback_query(lambda c: c.data == "mass_random_interval")
 async def process_mass_random_interval_callback(callback: CallbackQuery, state: FSMContext):
@@ -814,10 +843,17 @@ async def process_random_settings(message: Message, state: FSMContext):
         
         if 10 <= min_interval <= max_interval <= 86400:
             await state.update_data(
+                interval=min_interval,  # Додаємо interval для сумісності
                 use_random=True,
                 min_random=min_interval,
                 max_random=max_interval
             )
+            logger.info(f"💾 Збережено рандомний інтервал між аккаунтами: {min_interval}-{max_interval} сек")
+            
+            # Перевіряємо чи дані збереглися
+            data_check = await state.get_data()
+            logger.info(f"🔍 Перевірка збереження: interval={data_check.get('interval')}, use_random={data_check.get('use_random')}, min_random={data_check.get('min_random')}, max_random={data_check.get('max_random')}")
+            
             await message.answer(f"✅ Встановлено рандомний інтервал: {min_interval}-{max_interval} секунд")
             await show_package_selection(message, state)
         else:
@@ -1045,15 +1081,15 @@ async def mass_select_all_packages_callback(callback: CallbackQuery, state: FSMC
     # Зберігаємо всі басейни
     await state.update_data(selected_package_id=0, selected_groups=all_groups)
     
-    # Перевіряємо чи вже налаштовані інтервали між повідомленнями
+    # Перевіряємо чи вже налаштований основний інтервал між аккаунтами
     data = await state.get_data()
-    if not data.get('message_interval') and not data.get('use_random_message_interval'):
-        # Показуємо налаштування інтервалів між повідомленнями
+    if data.get('interval'):
         await show_message_interval_settings(callback, state)
+        await callback.answer()
     else:
         # Показуємо підтвердження
-        await show_mass_broadcast_confirmation(callback, state)
-    await callback.answer()
+        await show_interval_settings(callback, state)
+        await callback.answer()
 
 @router.callback_query(lambda c: c.data == "mass_select_all_chats")
 async def mass_select_all_chats_callback(callback: CallbackQuery, state: FSMContext):
@@ -1061,14 +1097,17 @@ async def mass_select_all_chats_callback(callback: CallbackQuery, state: FSMCont
     # Зберігаємо вибір всіх чатів
     await state.update_data(selected_package_id="all_chats")  # "all_chats" означає всі чати на аккаунті
     
-    # Перевіряємо чи вже налаштовані інтервали між повідомленнями
+    # Перевіряємо чи вже налаштований основний інтервал між аккаунтами
     data = await state.get_data()
-    if not data.get('message_interval') and not data.get('use_random_message_interval'):
-        # Показуємо налаштування інтервалів між повідомленнями
+    if data.get('interval'):
+        # Інтервал вже налаштований, переходимо до налаштування інтервалів між повідомленнями
+        logger.info("📋 Інтервал вже налаштований, показуємо налаштування інтервалів між повідомленнями")
         await show_message_interval_settings(callback, state)
     else:
-        # Показуємо підтвердження
-        await show_mass_broadcast_confirmation(callback, state)
+        # Інтервал не налаштований, показуємо налаштування основного інтервалу
+        logger.info("📋 Інтервал не налаштований, показуємо налаштування основного інтервалу між аккаунтами")
+        await show_interval_settings(callback, state)
+    
     await callback.answer()
 
 @router.callback_query(lambda c: c.data == "mass_send_to_single_group")
@@ -1107,8 +1146,18 @@ async def process_mass_single_group_id(message: Message, state: FSMContext):
     # Зберігаємо вибрану групу
     await state.update_data(selected_groups=[fake_group])
     
-    # Спочатку налаштовуємо інтервали між повідомленнями
-    await show_message_interval_settings(message, state)
+    # Перевіряємо чи вже налаштований основний інтервал між аккаунтами
+    data = await state.get_data()
+    logger.info(f"🔍 process_mass_single_group_id: interval={data.get('interval')}, use_random={data.get('use_random')}")
+    
+    if data.get('interval'):
+        # Інтервал вже налаштований, переходимо до налаштування інтервалів між повідомленнями
+        logger.info("📋 Інтервал вже налаштований, показуємо налаштування інтервалів між повідомленнями")
+        await show_message_interval_settings(message, state)
+    else:
+        # Інтервал не налаштований, показуємо налаштування основного інтервалу
+        logger.info("📋 Інтервал не налаштований, показуємо налаштування основного інтервалу між аккаунтами")
+        await show_interval_settings(message, state)
 
 async def show_mass_broadcast_confirmation(message_or_callback, state: FSMContext):
     """Показати підтвердження масової розсилки"""
@@ -1142,6 +1191,15 @@ async def show_mass_broadcast_confirmation(message_or_callback, state: FSMContex
     confirmation_text += f"📦 <b>Груп:</b> {total_groups}\n"
     confirmation_text += f"📝 <b>Тип повідомлення:</b> {message_type}\n"
     
+    # Показуємо інтервал циклічної розсилки, якщо він налаштований
+    if data.get('use_random_cycle_interval'):
+        cycle_min = data.get('cycle_interval_min')
+        cycle_max = data.get('cycle_interval_max')
+        if cycle_min and cycle_max:
+            confirmation_text += f"🔄 <b>Інтервал циклу:</b> {cycle_min}-{cycle_max} сек (рандом)\n"
+    elif data.get('cycle_interval'):
+        confirmation_text += f"🔄 <b>Інтервал циклу:</b> {data.get('cycle_interval')} сек\n"
+    
     if message_type == 'text':
         confirmation_text += f"📄 <b>Текст:</b> {message_text[:100]}{'...' if len(message_text) > 100 else ''}\n"
     else:
@@ -1152,6 +1210,7 @@ async def show_mass_broadcast_confirmation(message_or_callback, state: FSMContex
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚀 Запустити розсилку", callback_data="confirm_mass_broadcast")],
         [InlineKeyboardButton(text="🔄 Запустити в циклі", callback_data="confirm_loop_broadcast")],
+        [InlineKeyboardButton(text="⚙️ Налаштувати інтервал циклу", callback_data="set_cycle_interval")],
         [InlineKeyboardButton(text="❌ Скасувати", callback_data="Mass_broadcast")]
     ])
     
@@ -1170,7 +1229,6 @@ async def confirm_mass_broadcast_callback(callback: CallbackQuery, state: FSMCon
     message_type = data.get('message_type', 'text')
     file_path = data.get('media_file_path', '')
     interval = data.get('interval', 60)
-    use_random = data.get('use_random', False)
     
     # Перевіряємо чи є групи для розсилки
     if not selected_groups and selected_package_id != "all_chats":
@@ -1206,9 +1264,19 @@ async def confirm_mass_broadcast_callback(callback: CallbackQuery, state: FSMCon
     await callback.message.answer("🚀 Масову розсилку запущено! Ви можете відстежити прогрес через 'Статус розсилання'.\n\n"
                                  "🛑 Для зупинки використайте команду /stop_message")
     
+    # Зберігаємо дані основного інтервалу між аккаунтами
+    account_interval_data = {
+        'interval': data.get('interval'),
+        'use_random': data.get('use_random'),
+        'min_random': data.get('min_random'),
+        'max_random': data.get('max_random')
+    }
+    
     # Запускаємо масову розсилку в фоновому режимі
     asyncio.create_task(mass_broadcast_process(
-        message_data, interval, use_random, 30, 120, data.get('selected_package_id', 0), callback.message,
+        message_data, interval, data.get('use_random', False), 
+        data.get('min_random', 30), data.get('max_random', 120), 
+        data.get('selected_package_id', 0), callback.message,
         data.get('message_interval', 10), data.get('use_random_message_interval', False), 
         data.get('min_message_interval', 5), data.get('max_message_interval', 30),
         account_messages=data.get('account_messages', {}),
@@ -1216,11 +1284,14 @@ async def confirm_mass_broadcast_callback(callback: CallbackQuery, state: FSMCon
         media_file_path=file_path,
         media_file_id=data.get('media_file_id'),
         selected_groups=data.get('selected_groups', []),
-        state=state
+        state=state,
+        account_interval_data=account_interval_data
     ))
     
     await state.clear()
     await callback.answer()
+
+
 
 @router.callback_query(lambda c: c.data == "confirm_loop_broadcast")
 async def confirm_loop_broadcast_callback(callback: CallbackQuery, state: FSMContext):
@@ -1231,8 +1302,20 @@ async def confirm_loop_broadcast_callback(callback: CallbackQuery, state: FSMCon
     message_text = data.get('message_text', '')
     message_type = data.get('message_type', 'text')
     file_path = data.get('media_file_path', '')
-    interval = data.get('interval', 60)
-    use_random = data.get('use_random', False)
+    # Логуємо всі дані FSM перед визначенням інтервалу
+    logger.info(f"🔍 FSM дані в confirm_loop_broadcast_callback: use_random_cycle_interval={data.get('use_random_cycle_interval')}, cycle_interval={data.get('cycle_interval')}, cycle_interval_min={data.get('cycle_interval_min')}, cycle_interval_max={data.get('cycle_interval_max')}, interval={data.get('interval')}")
+    
+    # Визначаємо інтервал для циклічної розсилки
+    if data.get('use_random_cycle_interval'):
+        # Використовуємо рандомний інтервал циклу
+        cycle_min = data.get('cycle_interval_min', 30)
+        cycle_max = data.get('cycle_interval_max', 120)
+        interval = random.randint(cycle_min, cycle_max)
+        logger.info(f"🎲 Використовуємо рандомний інтервал циклу: {interval} сек (діапазон: {cycle_min}-{cycle_max})")
+    else:
+        # Використовуємо фіксований інтервал
+        interval = data.get('cycle_interval', data.get('interval', 60))
+        logger.info(f"⏳ Використовуємо інтервал: {interval} сек (cycle_interval={data.get('cycle_interval')}, interval={data.get('interval')})")
     
     # Перевіряємо чи є басейни для розсилки
     if not selected_groups and selected_package_id != "all_chats":
@@ -1268,9 +1351,27 @@ async def confirm_loop_broadcast_callback(callback: CallbackQuery, state: FSMCon
     await callback.message.answer("🔄 Циклічну розсилку запущено! Ви можете відстежити прогрес через 'Статус розсилання'.\n\n"
                                  "🛑 Для зупинки використайте команду /stop_message")
     
+    # Зберігаємо дані інтервалу циклу та основного інтервалу перед очищенням стану
+    cycle_interval_data = {
+        'cycle_interval': data.get('cycle_interval'),
+        'cycle_interval_min': data.get('cycle_interval_min'),
+        'cycle_interval_max': data.get('cycle_interval_max'),
+        'use_random_cycle_interval': data.get('use_random_cycle_interval')
+    }
+    
+    # Зберігаємо дані основного інтервалу між аккаунтами
+    account_interval_data = {
+        'interval': data.get('interval'),
+        'use_random': data.get('use_random'),
+        'min_random': data.get('min_random'),
+        'max_random': data.get('max_random')
+    }
+    
     # Запускаємо циклічну розсилку в фоновому режимі
     asyncio.create_task(loop_broadcast_process(
-        message_data, interval, use_random, 30, 120, data.get('selected_package_id', 0), callback.message,
+        message_data, interval, data.get('use_random', False), 
+        data.get('min_random', 30), data.get('max_random', 120), 
+        data.get('selected_package_id', 0), callback.message,
         data.get('message_interval', 10), data.get('use_random_message_interval', False), 
         data.get('min_message_interval', 5), data.get('max_message_interval', 30),
         account_messages=data.get('account_messages', {}),
@@ -1278,11 +1379,82 @@ async def confirm_loop_broadcast_callback(callback: CallbackQuery, state: FSMCon
         media_file_path=file_path,
         media_file_id=data.get('media_file_id'),
         selected_groups=data.get('selected_groups', []),
-        state=state
+        state=state,
+        cycle_interval_data=cycle_interval_data,
+        account_interval_data=account_interval_data
     ))
     
     await state.clear()
     await callback.answer()
+
+@router.callback_query(lambda c: c.data == "set_cycle_interval")
+async def set_cycle_interval_callback(callback: CallbackQuery, state: FSMContext):
+    """Обробка налаштування інтервалу для циклічної розсилки"""
+    await callback.message.answer(
+        "⚙️ <b>Налаштування інтервалу між аккаунтами для циклічної розсилки:</b>\n\n"
+        "Введіть інтервал в секундах через кому(мінімум 10, максимум 3600):\n\n"
+        "💡 <b>Рекомендовані значення:</b>\n"
+        "• 30-60 сек - швидка розсилка\n"
+        "• 60-120 сек - середня швидкість\n"
+        "• 120-300 сек - повільна розсилка",
+        parse_mode='HTML'
+    )
+    await state.set_state(MassBroadcastStates.waiting_for_cycle_interval)
+    await callback.answer()
+
+@router.message(MassBroadcastStates.waiting_for_cycle_interval)
+async def process_cycle_interval(message: Message, state: FSMContext):
+    """Обробка введення інтервалу для циклічної розсилки"""
+    try:
+        text = message.text.strip()
+        
+        # Перевіряємо чи це діапазон (містить кому)
+        if ',' in text:
+            # Діапазон інтервалів
+            parts = text.split(',')
+            if len(parts) != 2:
+                await message.answer("❌ Неправильний формат. Використовуйте: min,max (наприклад: 30,120)")
+                return
+            
+            min_interval = int(parts[0].strip())
+            max_interval = int(parts[1].strip())
+            
+            if min_interval < 10 or max_interval > 3600 or min_interval >= max_interval:
+                await message.answer("❌ Неправильний діапазон. Мінімум: 10, максимум: 3600, min < max")
+                return
+            
+            # Зберігаємо діапазон для циклічної розсилки
+            await state.update_data(
+                cycle_interval_min=min_interval,
+                cycle_interval_max=max_interval,
+                use_random_cycle_interval=True
+            )
+            
+            logger.info(f"💾 Збережено рандомний інтервал циклу: {min_interval}-{max_interval} сек, use_random_cycle_interval=True")
+            await message.answer(f"✅ Встановлено рандомний інтервал між аккаунтами для циклічної розсилки: {min_interval}-{max_interval} секунд")
+            
+        else:
+            # Фіксований інтервал
+            interval = int(text)
+            
+            if interval < 10 or interval > 3600:
+                await message.answer("❌ Інтервал повинен бути від 10 до 3600 секунд.")
+                return
+            
+            # Зберігаємо фіксований інтервал для циклічної розсилки
+            await state.update_data(
+                cycle_interval=interval,
+                use_random_cycle_interval=False
+            )
+            
+            logger.info(f"💾 Збережено фіксований інтервал циклу: {interval} сек, use_random_cycle_interval=False")
+            await message.answer(f"✅ Встановлено фіксований інтервал між аккаунтами для циклічної розсилки: {interval} секунд")
+        
+        # Повертаємося до меню підтвердження
+        await show_mass_broadcast_confirmation(message, state)
+        
+    except ValueError:
+        await message.answer("❌ Неправильний формат. Введіть число або діапазон через кому (наприклад: 60 або 30,120).")
 
 async def mass_broadcast_process(message_text, interval: int, use_random: bool, 
                                min_random: int, max_random: int, selected_package_id: int, message_obj,
@@ -1290,7 +1462,7 @@ async def mass_broadcast_process(message_text, interval: int, use_random: bool,
                                min_message_interval: int = 5, max_message_interval: int = 30,
                                account_messages: dict = None, stop_event: asyncio.Event = None,
                                message_type: str = None, media_file_path: str = None, media_file_id: str = None, selected_groups: list = None,
-                               state: FSMContext = None, media_caption: str = None):
+                               state: FSMContext = None, media_caption: str = None, account_interval_data: dict = None):
     """Процес масової розсилки"""
     
     logger.info(f"🚀 Початок масової розсилки")
@@ -1407,6 +1579,14 @@ async def mass_broadcast_process(message_text, interval: int, use_random: bool,
         total_failed = 0
         
         for account_phone, groups in groups_by_account.items():
+            # Перевіряємо флаг зупинки перед обробкою кожного аккаунта
+            if state:
+                data = await state.get_data()
+                if data.get('stop_broadcast', False):
+                    logger.info("🛑 Отримано команду зупинки розсилки")
+                    await message_obj.answer("🛑 Масову розсилку зупинено користувачем.")
+                    return
+            
             try:
                 logger.info(f"📱 Обробляємо аккаунт: {account_phone} ({len(groups)} груп)")
                 
@@ -1459,6 +1639,15 @@ async def mass_broadcast_process(message_text, interval: int, use_random: bool,
                 # Відправляємо повідомлення в басейни цього аккаунта
                 logger.info(f"📤 Початок відправки повідомлень для аккаунта {account_phone}: {len(groups)} груп")
                 for j, group in enumerate(groups):
+                    # Перевіряємо флаг зупинки перед кожною групою
+                    if state:
+                        data = await state.get_data()
+                        if data.get('stop_broadcast', False):
+                            logger.info("🛑 Отримано команду зупинки розсилки")
+                            await message_obj.answer("🛑 Масову розсилку зупинено користувачем.")
+                            await client.disconnect()
+                            return
+                    
                     max_retries = 3
                     logger.info(f"📋 Обробляємо групу {j+1}/{len(groups)}: {group['name']} (ID: {group['group_id']})")
                     for attempt in range(max_retries):
@@ -1466,6 +1655,7 @@ async def mass_broadcast_process(message_text, interval: int, use_random: bool,
                             group_id = int(group['group_id'])
                             
                             logger.info(f"📤 Спроба {attempt + 1}/{max_retries} відправки в групу {group['name']} (ID: {group_id})")
+                            logger.info(f"🔍 Оригінальний ID з бази: {group['group_id']}, Конвертований: {group_id}")
                         
                             # Повідомляємо про початок відправки
                             await message_obj.answer(f"📤 <b>Відправляємо повідомлення:</b>\n\n"
@@ -1477,7 +1667,7 @@ async def mass_broadcast_process(message_text, interval: int, use_random: bool,
                             
                             success = await db.send_message_with_retry(
                                 client, 
-                                group_id, 
+                                str(group_id), 
                                 group['name'], 
                                 current_message,
                                 message_obj
@@ -1508,6 +1698,15 @@ async def mass_broadcast_process(message_text, interval: int, use_random: bool,
                             
                             # Затримка між повідомленнями
                             if j < len(groups) - 1:  # Не чекаємо після останнього повідомлення
+                                # Перевіряємо флаг зупинки перед затримкою
+                                if state:
+                                    data = await state.get_data()
+                                    if data.get('stop_broadcast', False):
+                                        logger.info("🛑 Отримано команду зупинки розсилки")
+                                        await message_obj.answer("🛑 Масову розсилку зупинено користувачем.")
+                                        await client.disconnect()
+                                        return
+                                
                                 if use_random_message_interval:
                                     delay = random.randint(min_message_interval, max_message_interval)
                                     await message_obj.answer(f"⏳ <b>Затримка між повідомленнями:</b>\n\n"
@@ -1543,7 +1742,17 @@ async def mass_broadcast_process(message_text, interval: int, use_random: bool,
                             
                             # Перевіряємо тип помилки
                             if "Could not find the input entity" in error_msg:
-                                logger.error(f"❌ Група {group['name']} не існує або недоступна")
+                                logger.error(f"❌ Група {group['name']} (ID: {group_id}) не існує або недоступна для аккаунта {account_phone}")
+                                logger.error(f"💡 Можливі причини: група видалена, аккаунт заблокований, група стала приватною")
+                                await message_obj.answer(f"❌ <b>Група недоступна:</b>\n\n"
+                                                       f"📝 <b>Група:</b> {group['name']}\n"
+                                                       f"🆔 <b>ID:</b> {group_id}\n"
+                                                       f"📱 <b>Аккаунт:</b> {account_phone}\n\n"
+                                                       f"💡 <b>Можливі причини:</b>\n"
+                                                       f"• Група була видалена\n"
+                                                       f"• Аккаунт заблокований в групі\n"
+                                                       f"• Група стала приватною",
+                                                       parse_mode='HTML')
                                 total_failed += 1
                                 logger.info(f"📊 Статистика після помилки: відправлено={total_sent}, невдало={total_failed}")
                                 break
@@ -1576,8 +1785,27 @@ async def mass_broadcast_process(message_text, interval: int, use_random: bool,
                 await client.disconnect()
                 
                 # Затримка між аккаунтами
-                delay = state.data.get('interval', interval)
-                logger.info(f"⏳ Затримка між аккаунтами: {delay} секунд")
+                # Перевіряємо флаг зупинки перед затримкою між аккаунтами
+                if state:
+                    data = await state.get_data()
+                    if data.get('stop_broadcast', False):
+                        logger.info("🛑 Отримано команду зупинки розсилки")
+                        await message_obj.answer("🛑 Масову розсилку зупинено користувачем.")
+                        return
+                
+                # Використовуємо збережені дані інтервалу між аккаунтами
+                if account_interval_data:
+                    if account_interval_data.get('use_random'):
+                        delay = random.randint(account_interval_data.get('min_random', 30), account_interval_data.get('max_random', 120))
+                        logger.info(f"🎲 Рандомний інтервал між аккаунтами: {delay} сек (діапазон: {account_interval_data.get('min_random')}-{account_interval_data.get('max_random')})")
+                    else:
+                        delay = account_interval_data.get('interval', interval)
+                        logger.info(f"⏳ Фіксований інтервал між аккаунтами: {delay} сек")
+                else:
+                    # Fallback до FSM даних
+                    data = await state.get_data()
+                    delay = data.get('interval', interval)
+                    logger.info(f"⏳ Fallback інтервал між аккаунтами: {delay} сек (data.interval={data.get('interval')}, param.interval={interval})")
                 await asyncio.sleep(delay)
                 
                 logger.info(f"✅ Завершено обробку аккаунта {account_phone}")
@@ -1644,7 +1872,7 @@ async def loop_broadcast_process(message_text, interval: int, use_random: bool,
                                min_message_interval: int = 5, max_message_interval: int = 30,
                                account_messages: dict = None, stop_event: asyncio.Event = None,
                                message_type: str = None, media_file_path: str = None, media_file_id: str = None, selected_groups: list = None,
-                               state: FSMContext = None, media_caption: str = None):
+                               state: FSMContext = None, media_caption: str = None, cycle_interval_data: dict = None, account_interval_data: dict = None):
     """Процес циклічної розсилки"""
     
     logger.info("🚀 Початок циклічної розсилки")
@@ -1754,6 +1982,14 @@ async def loop_broadcast_process(message_text, interval: int, use_random: bool,
     
         # Циклічна розсилка: кожен аккаунт відправляє по всіх своїх басейнах, потім перехід до наступного
         while True:
+            # Перевіряємо флаг зупинки на початку кожного циклу
+            if state:
+                data = await state.get_data()
+                if data.get('stop_broadcast', False):
+                    logger.info("🛑 Отримано команду зупинки розсилки")
+                    await message_obj.answer("🛑 Циклічна розсилка зупинена користувачем.")
+                    break
+            
             cycle_count += 1
             logger.info(f"🔄 Початок циклу #{cycle_count}")
             await message_obj.answer(f"🔄 <b>Початок циклу #{cycle_count}</b>\n\n"
@@ -1763,6 +1999,14 @@ async def loop_broadcast_process(message_text, interval: int, use_random: bool,
             
             # Проходимо по всіх аккаунтах
             for account_phone, groups in groups_by_account.items():
+                # Перевіряємо флаг зупинки перед обробкою кожного аккаунта
+                if state:
+                    data = await state.get_data()
+                    if data.get('stop_broadcast', False):
+                        logger.info("🛑 Отримано команду зупинки розсилки")
+                        await message_obj.answer("🛑 Циклічну розсилку зупинено користувачем.")
+                        return
+                
                 try:
                     logger.info(f"📱 Обробляємо аккаунт: {account_phone} ({len(groups)} груп)")
                     # Отримуємо дані аккаунта
@@ -1818,11 +2062,22 @@ async def loop_broadcast_process(message_text, interval: int, use_random: bool,
                     # Відправляємо повідомлення в групи цього аккаунта
                     logger.info(f"📤 Початок відправки повідомлень для аккаунта {account_phone}: {len(groups)} груп")
                     for j, group in enumerate(groups):
+                        # Перевіряємо флаг зупинки перед кожною групою
+                        if state:
+                            data = await state.get_data()
+                            if data.get('stop_broadcast', False):
+                                logger.info("🛑 Отримано команду зупинки розсилки")
+                                await message_obj.answer("🛑 Циклічну розсилку зупинено користувачем.")
+                                await client.disconnect()
+                                return
+                        
                         max_retries = 3
                         logger.info(f"📋 Обробляємо групу {j+1}/{len(groups)}: {group['name']} (ID: {group['group_id']})")
                         for attempt in range(max_retries):
                             try:
                                 group_id = int(group['group_id'])
+                                
+                                logger.info(f"🔍 Оригінальний ID з бази: {group['group_id']}, Конвертований: {group_id}")
                                 
                                 # Повідомляємо про початок відправки
                                 await message_obj.answer(f"📤 <b>Відправляємо повідомлення:</b>\n\n"
@@ -1835,7 +2090,7 @@ async def loop_broadcast_process(message_text, interval: int, use_random: bool,
                                 logger.info(f"📤 Спроба {attempt + 1}/{max_retries} відправки в групу {group['name']} (ID: {group_id})")
                                 success = await db.send_message_with_retry(
                                     client, 
-                                    group_id, 
+                                    str(group_id), 
                                     group['name'], 
                                     current_message,
                                     message_obj
@@ -1852,6 +2107,15 @@ async def loop_broadcast_process(message_text, interval: int, use_random: bool,
                                     
                                 # Затримка між повідомленнями
                                 if j < len(groups) - 1:  # Не чекаємо після останнього повідомлення
+                                    # Перевіряємо флаг зупинки перед затримкою
+                                    if state:
+                                        data = await state.get_data()
+                                        if data.get('stop_broadcast', False):
+                                            logger.info("🛑 Отримано команду зупинки розсилки")
+                                            await message_obj.answer("🛑 Циклічну розсилку зупинено користувачем.")
+                                            await client.disconnect()
+                                            return
+                                    
                                     if use_random_message_interval:
                                         delay = random.randint(min_message_interval, max_message_interval)
                                         await message_obj.answer(f"⏳ <b>Затримка між повідомленнями:</b>\n\n"
@@ -1886,7 +2150,17 @@ async def loop_broadcast_process(message_text, interval: int, use_random: bool,
                                 logger.warning(f"⚠️ Спроба {attempt + 1}/{max_retries} невдала для групи {group['name']}: {error_msg}")
                                 
                                 if "Could not find the input entity" in error_msg:
-                                    logger.error(f"❌ Група {group['name']} не існує або недоступна")
+                                    logger.error(f"❌ Група {group['name']} (ID: {group_id}) не існує або недоступна для аккаунта {account_phone}")
+                                    logger.error(f"💡 Можливі причини: група видалена, аккаунт заблокований, група стала приватною")
+                                    await message_obj.answer(f"❌ <b>Група недоступна:</b>\n\n"
+                                                           f"📝 <b>Група:</b> {group['name']}\n"
+                                                           f"🆔 <b>ID:</b> {group_id}\n"
+                                                           f"📱 <b>Аккаунт:</b> {account_phone}\n\n"
+                                                           f"💡 <b>Можливі причини:</b>\n"
+                                                           f"• Група була видалена\n"
+                                                           f"• Аккаунт заблокований в групі\n"
+                                                           f"• Група стала приватною",
+                                                           parse_mode='HTML')
                                     total_failed += 1
                                     logger.info(f"📊 Статистика після помилки: відправлено={total_sent}, невдало={total_failed}")
                                     break
@@ -1906,8 +2180,27 @@ async def loop_broadcast_process(message_text, interval: int, use_random: bool,
                     
                     # Затримка між аккаунтами (тільки якщо не останній аккаунт)
                     if account_phone != list(groups_by_account.keys())[-1]:
-                        delay = state.data.get('interval', interval)
-                        logger.info(f"⏳ Затримка між аккаунтами: {delay} секунд")
+                        # Перевіряємо флаг зупинки перед затримкою між аккаунтами
+                        if state:
+                            data = await state.get_data()
+                            if data.get('stop_broadcast', False):
+                                logger.info("🛑 Отримано команду зупинки розсилки")
+                                await message_obj.answer("🛑 Циклічну розсилку зупинено користувачем.")
+                                return
+                        
+                        # Використовуємо збережені дані інтервалу між аккаунтами
+                        if account_interval_data:
+                            if account_interval_data.get('use_random'):
+                                delay = random.randint(account_interval_data.get('min_random', 30), account_interval_data.get('max_random', 120))
+                                logger.info(f"🎲 Рандомний інтервал між аккаунтами: {delay} сек (діапазон: {account_interval_data.get('min_random')}-{account_interval_data.get('max_random')})")
+                            else:
+                                delay = account_interval_data.get('interval', interval)
+                                logger.info(f"⏳ Фіксований інтервал між аккаунтами: {delay} сек")
+                        else:
+                            # Fallback до FSM даних
+                            data = await state.get_data()
+                            delay = data.get('interval', interval)
+                            logger.info(f"⏳ Fallback інтервал між аккаунтами: {delay} сек (data.interval={data.get('interval')}, param.interval={interval})")
                         await message_obj.answer(f"⏳ <b>Затримка між аккаунтами:</b>\n\n"
                                                f"🕐 <b>Чекаємо:</b> {delay} секунд\n"
                                                f"📱 <b>Наступний аккаунт:</b> {list(groups_by_account.keys())[list(groups_by_account.keys()).index(account_phone) + 1]}",
@@ -1921,22 +2214,61 @@ async def loop_broadcast_process(message_text, interval: int, use_random: bool,
                     continue
             
             # Затримка між циклами (рандомна від 10 до 120 секунд)
-            delay = state.data.get('interval')
-            logger.info(f"⏳ Затримка між циклами: {delay} секунд")
-            logger.info(f"📊 Статистика циклу #{cycle_count}: відправлено={total_sent}, невдало={total_failed}")
-            await message_obj.answer(f"⏳ <b>Затримка між циклами:</b>\n\n"
-                                   f"🕐 <b>Чекаємо:</b> {delay} секунд\n"
-                                   f"🔄 <b>Наступний цикл:</b> #{cycle_count + 1}",
-                                   parse_mode='HTML')
-            await asyncio.sleep(delay)
-            
-            # Перевіряємо флаг зупинки
+            # Перевіряємо флаг зупинки перед затримкою між циклами
             if state:
                 data = await state.get_data()
                 if data.get('stop_broadcast', False):
                     logger.info("🛑 Отримано команду зупинки розсилки")
                     await message_obj.answer("🛑 Циклічна розсилка зупинена користувачем.")
                     break
+            
+            # Використовуємо збережені дані інтервалу циклу
+            if cycle_interval_data:
+                logger.info(f"🔍 Дані інтервалу циклу: use_random_cycle_interval={cycle_interval_data.get('use_random_cycle_interval')}, cycle_interval={cycle_interval_data.get('cycle_interval')}, cycle_interval_min={cycle_interval_data.get('cycle_interval_min')}, cycle_interval_max={cycle_interval_data.get('cycle_interval_max')}")
+                
+                # Генеруємо інтервал для наступного циклу
+                if cycle_interval_data.get('use_random_cycle_interval'):
+                    # Використовуємо рандомний інтервал циклу
+                    cycle_min = cycle_interval_data.get('cycle_interval_min', 30)
+                    cycle_max = cycle_interval_data.get('cycle_interval_max', 120)
+                    delay = random.randint(cycle_min, cycle_max)
+                    logger.info(f"🎲 Згенеровано рандомний інтервал між циклами: {delay} секунд (діапазон: {cycle_min}-{cycle_max})")
+                else:
+                    # Використовуємо фіксований інтервал
+                    delay = cycle_interval_data.get('cycle_interval', 60)
+                    logger.info(f"⏳ Фіксований інтервал між циклами: {delay} секунд")
+            else:
+                # Fallback до FSM даних (якщо cycle_interval_data не передано)
+                data = await state.get_data()
+                logger.info(f"🔍 Fallback до FSM даних: use_random_cycle_interval={data.get('use_random_cycle_interval')}, cycle_interval={data.get('cycle_interval')}")
+                delay = data.get('cycle_interval', data.get('interval', 60))
+                logger.info(f"⏳ Fallback інтервал між циклами: {delay} секунд")
+            
+            logger.info(f"📊 Статистика циклу #{cycle_count}: відправлено={total_sent}, невдало={total_failed}")
+            
+            # Визначаємо чи використовується рандомний інтервал для повідомлення
+            use_random_for_message = False
+            if cycle_interval_data:
+                use_random_for_message = cycle_interval_data.get('use_random_cycle_interval', False)
+            else:
+                data = await state.get_data()
+                use_random_for_message = data.get('use_random_cycle_interval', False)
+            
+            if use_random_for_message:
+                cycle_min = cycle_interval_data.get('cycle_interval_min', 30) if cycle_interval_data else 30
+                cycle_max = cycle_interval_data.get('cycle_interval_max', 120) if cycle_interval_data else 120
+                await message_obj.answer(f"⏳ <b>Затримка між циклами:</b>\n\n"
+                                       f"🕐 <b>Чекаємо:</b> {delay} секунд\n"
+                                       f"🎲 <b>Рандомний інтервал:</b> {cycle_min}-{cycle_max} сек\n"
+                                       f"🔄 <b>Наступний цикл:</b> #{cycle_count + 1}",
+                                       parse_mode='HTML')
+            else:
+                await message_obj.answer(f"⏳ <b>Затримка між циклами:</b>\n\n"
+                                       f"🕐 <b>Чекаємо:</b> {delay} секунд\n"
+                                       f"🔄 <b>Наступний цикл:</b> #{cycle_count + 1}",
+                                       parse_mode='HTML')
+            
+            await asyncio.sleep(delay)
         
     except Exception as e:  # except для try блоку на лінії 1586
         logger.error(f"❌ Критична помилка в циклічній розсилці: {e}")
@@ -1953,6 +2285,11 @@ async def stop_message_command(message: Message, state: FSMContext):
     # Встановлюємо флаг зупинки в FSM state
     await state.update_data(stop_broadcast=True)
     await message.answer("🛑 <b>Команда зупинки розсилки отримана!</b>\n\n"
-                        "⏳ Активні розсилки будуть зупинені після завершення поточного повідомлення.",
+                        "⏳ Активні розсилки будуть зупинені:\n"
+                        "• Після завершення поточного повідомлення\n"
+                        "• Перед наступною затримкою\n"
+                        "• Перед обробкою наступного аккаунта\n"
+                        "• Перед наступним циклом (для циклічної розсилки)\n\n"
+                        "📊 Статус зупинки буде показано в наступних повідомленнях.",
                         parse_mode='HTML')
 
