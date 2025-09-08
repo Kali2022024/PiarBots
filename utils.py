@@ -10,23 +10,34 @@ logger = logging.getLogger(__name__)
 
 # Глобальні змінні для емодзі та стикерів
 RANDOM_EMOJIS = ['😊', '👍', '🔥', '💯', '✨', '🎉', '🚀', '💪', '⭐', '❤️', '😍', '🤩', '💖', '🌟', '🎊', '🎈', '🎁', '🏆', '🥇', '💎']
+RANDOM_STICKERS = ['CAACAgQAAxkBAAEBkqFovqUYLssyO56Z8oyXoX9o0YPUtAACQRAAAiypQFCTfE64pcQeZDYE', 'CAACAgQAAxkBAAEBkqpovqnmzzUvCQUQ5EvrRnuRIc9UVgACSxMAAuJz0VBRcPV9Q2figDYE', 'CAACAgIAAxkBAAEBkqxovqnnwqQQxDLE0xIByhvsKqgMEQACFxQAAlXX2Es_ehiLlrWrKDYE', 'CAACAgQAAxkBAAEBkqpovqnmzzUvCQUQ5EvrRnuRIc9UVgACSxMAAuJz0VBRcPV9Q2figDYE']
 
 def add_random_emoji_to_text(text: str) -> str:
-    """Додає випадкові емоції до тексту"""
-    # Випадково вибираємо кількість емоцій (1-3)
-    num_emojis = random.randint(1, 3)
+    """Додає випадкові емоції до тексту (тільки на початку або в кінці)"""
+    if not text.strip():
+        return text
     
-    # Випадково вибираємо позиції для емоцій
-    positions = random.sample(range(len(text) + 1), min(num_emojis, len(text) + 1))
-    positions.sort()
+    # Випадково вибираємо кількість емоцій (1-2)
+    num_emojis = random.randint(1, 2)
     
-    # Додаємо емоції
-    result = text
-    for i, pos in enumerate(positions):
-        emoji = random.choice(RANDOM_EMOJIS)
-        result = result[:pos + i] + emoji + result[pos + i:]
+    # Вибираємо емоції
+    emojis = [random.choice(RANDOM_EMOJIS) for _ in range(num_emojis)]
     
-    return result
+    # Випадково вибираємо позиції: початок, кінець, або обидва
+    position_choice = random.choice(['start', 'end', 'both'])
+    
+    if position_choice == 'start':
+        # Тільки на початку
+        return emojis[0] + ' ' + text
+    elif position_choice == 'end':
+        # Тільки в кінці
+        return text + ' ' + emojis[0]
+    else:  # both
+        # На початку та в кінці
+        if len(emojis) >= 2:
+            return emojis[0] + ' ' + text + ' ' + emojis[1]
+        else:
+            return emojis[0] + ' ' + text + ' ' + emojis[0]
 
 async def simulate_typing(client, entity, duration: int = None):
     """Імітує статус 'печатает...'"""
@@ -36,12 +47,12 @@ async def simulate_typing(client, entity, duration: int = None):
     try:
         await client.send_read_acknowledge(entity)
         # Відправляємо статус "печатает"
-        action = client.action(entity, 'typing')
-        await action
-        await asyncio.sleep(duration)
+        async with client.action(entity, 'typing'):
+            await asyncio.sleep(duration)
     except Exception as e:
         logger.warning(f"⚠️ Не вдалося імітувати друк: {e}")
-
+    else:
+        logger.info("✅ Імітація набору успішна")
 async def add_random_pause():
     """Додає випадкову паузу для імітації реального користувача"""
     # Випадкова пауза від 1 до 3 секунд
@@ -52,23 +63,7 @@ def should_send_sticker() -> bool:
     """Визначає чи потрібно відправити стикер замість тексту"""
     # 10% шанс відправити стикер
     return random.random() < 0.1
-
-def get_media_type_from_file(file_path: str) -> str:
-    """Визначає тип медіа-файлу за розширенням"""
-    extension = os.path.splitext(file_path.lower())[1]
     
-    image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']
-    video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv']
-    audio_extensions = ['.mp3', '.wav', '.ogg', '.m4a', '.flac', '.aac']
-    
-    if extension in image_extensions:
-        return 'photo'
-    elif extension in video_extensions:
-        return 'video'
-    elif extension in audio_extensions:
-        return 'audio'
-    else:
-        return 'document'
 
 async def download_media_file(bot, file_id: str, file_path: str) -> bool:
     """Завантажує медіа-файл з Telegram"""

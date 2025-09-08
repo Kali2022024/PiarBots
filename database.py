@@ -4,6 +4,7 @@ import logging
 import asyncio
 import random
 from telethon.errors import FloodWaitError
+from aiogram import Bot
 
 # Налаштування логування
 logger = logging.getLogger(__name__)
@@ -15,6 +16,11 @@ class Database:
     def __init__(self, db_path: str = "accounts.db"):
         self.db_path = db_path
         self.init_database()
+    
+    def get_bot(self):
+        """Отримує екземпляр бота з config"""
+        from config import bot
+        return bot
     
     def init_database(self):
         """Ініціалізація бази даних та створення таблиць"""
@@ -435,6 +441,8 @@ class Database:
                             # Якщо стикер не вдався, відправляємо текст
                             await client.send_message(entity, enhanced_message)
                             logger.info(f"✅ Повідомлення успішно відправлено в групу {group_name} ({group_id})")
+                        else:
+                            logger.info(f"✅ Відправлено стикер")
                     else:
                         # Відправляємо текст з емоціями
                         await client.send_message(entity, enhanced_message)
@@ -463,24 +471,41 @@ class Database:
                             await client.send_message(entity, enhanced_message)
                             logger.info(f"✅ Повідомлення успішно відправлено в групу {group_name} ({group_id})")
                     
-                    elif message_type in ['photo', 'video', 'audio', 'document'] and file_path:
+                    elif message_type in ['photo', 'video', 'audio', 'document','sticker','voice','animation']:
                         # Медіа-повідомлення
                         import os
-                        if os.path.exists(file_path):
+                        file_id = message_data.get('file_id')
+                        
+                        # Для стікерів відправляємо як файл
+                        if message_type == 'sticker':
+                            success = await self.send_sticker_as_file(client, entity, file_id, file_path)
+                            if success:
+                                logger.info(f"✅ Стікер відправлено в групу {group_name} ({group_id})")
+                            else:
+                                logger.warning(f"⚠️ Не вдалося відправити стікер")
+                                return False
+                        elif file_path and os.path.exists(file_path):
                             # Підготовка підпису
                             caption = text
                             if caption and should_add_emoji_to_caption():
                                 caption = add_random_emoji_to_text(caption)
                             
+                            # Використовуємо тільки file_path для медіа-файлів
+                            media_source = file_path
+                            
                             # Відправка медіа
                             if message_type == 'photo':
-                                await client.send_file(entity, file_path, caption=caption)
+                                await client.send_file(entity, media_source, caption=caption)
                             elif message_type == 'video':
-                                await client.send_file(entity, file_path, caption=caption, video_note=False)
+                                await client.send_file(entity, media_source, caption=caption, video_note=False)
                             elif message_type == 'audio':
-                                await client.send_file(entity, file_path, caption=caption, voice_note=False)
+                                await client.send_file(entity, media_source, caption=caption, voice_note=False)
+                            elif message_type == 'animation':
+                                await client.send_file(entity, media_source, caption=caption)
+                            elif message_type == 'voice':
+                                await client.send_file(entity, media_source)
                             else:  # document
-                                await client.send_file(entity, file_path, caption=caption)
+                                await client.send_file(entity, media_source, caption=caption)
                             
                             logger.info(f"✅ {message_type.capitalize()} успішно відправлено в групу {group_name} ({group_id})")
                             
@@ -494,7 +519,10 @@ class Database:
                                 except Exception as sticker_error:
                                     logger.warning(f"⚠️ Не вдалося відправити додатковий стикер: {sticker_error}")
                         else:
-                            logger.error(f"❌ Файл {file_path} не існує")
+                            if message_type == 'sticker':
+                                logger.error(f"❌ Sticker file_id не знайдено")
+                            else:
+                                logger.error(f"❌ Файл {file_path} не існує")
                             return False
                     else:
                         logger.error(f"❌ Неправильний формат повідомлення: {message_data}")
@@ -804,3 +832,31 @@ class Database:
                 logger.error(f"❌ Помилка при оновленні налаштувань масової розсилки: {e}")
                 return False
         return False
+    
+    async def send_sticker_as_file(self, client, entity, file_id, file_path):
+        """Відправляє стікер як файл"""
+        try:
+            # Спочатку намагаємося відправити завантажений файл
+            if file_path and os.path.exists(file_path):
+                await client.send_file(entity, file_path)
+                logger.info(f"✅ Стікер відправлено як файл: {file_path}")
+                return True
+            else:
+                # Fallback: завантажуємо стікер через Bot API
+                from utils import download_media_file
+                
+                # Створюємо шлях для стікера
+                sticker_path = f"media_files/sticker_{file_id}.webp"
+                
+                # Завантажуємо стікер через Bot API
+                bot = self.get_bot()  # Отримуємо бота
+                await download_media_file(bot, file_id, sticker_path)
+                
+                # Відправляємо стікер як файл
+                await client.send_file(entity, sticker_path)
+                logger.info(f"✅ Стікер відправлено як файл (fallback): {sticker_path}")
+                return True
+                
+        except Exception as e:
+            logger.warning(f"⚠️ Помилка при відправці стікера: {e}")
+            return False

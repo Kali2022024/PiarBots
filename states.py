@@ -39,6 +39,7 @@ class MassBroadcastStates(StatesGroup):
     waiting_for_message_type = State()
     waiting_for_media_file = State()
     waiting_for_media_caption = State()
+    waiting_for_single_group_id = State()
 
 class DeletePackageStates(StatesGroup):
     waiting_for_package_name = State()
