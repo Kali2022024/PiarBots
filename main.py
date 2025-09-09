@@ -14,7 +14,6 @@ from states import *
 from utils import show_accounts_list
 from registration import router as registration_router, init_registration_module
 from groups import router as groups_router, init_groups_module
-from broadcast import router as broadcast_router, init_broadcast_module
 from mass_broadcast import router as mass_broadcast_router, init_mass_broadcast_module
 from join_groups import router as join_groups_router, init_join_groups_module
 
@@ -44,7 +43,6 @@ db = Database()
 # Ініціалізація модулів
 init_registration_module(API_ID, API_HASH, db)
 init_groups_module(db)
-init_broadcast_module(db)
 init_mass_broadcast_module(db, bot)
 init_join_groups_module(db)
 
@@ -74,12 +72,11 @@ async def cmd_start(message: Message):
         [InlineKeyboardButton(text="📋 Список аккаунтів", callback_data="accounts")],
         [InlineKeyboardButton(text="📱 Зареєструвати номер", callback_data="register_number")],
         [InlineKeyboardButton(text="🗑️ Видалити аккаунт", callback_data="delete_account")],
-        [InlineKeyboardButton(text="📤 Запуск розсилання", callback_data="Message_in_all_chat_for_account")],
         [InlineKeyboardButton(text="👥 Додати список груп", callback_data="Groups_for_account")],
         [InlineKeyboardButton(text="➕ Додатись в групи", callback_data="join_groups")],
         [InlineKeyboardButton(text="🗑️ Видалити пакет груп", callback_data="delete_group_package")],
         [InlineKeyboardButton(text="📊 Статус розсилання", callback_data="broadcast_status")],
-        [InlineKeyboardButton(text="📤 Масова розсилка", callback_data="Mass_broadcast")]
+        [InlineKeyboardButton(text="📤 Функціональна роозсилка", callback_data="Mass_broadcast")]
     ])
     
     await message.answer(welcome_text, reply_markup=keyboard)
@@ -104,7 +101,6 @@ async def main():
         dp.include_router(router)
         dp.include_router(registration_router)
         dp.include_router(groups_router)
-        dp.include_router(broadcast_router)
         dp.include_router(mass_broadcast_router)
         dp.include_router(join_groups_router)
         

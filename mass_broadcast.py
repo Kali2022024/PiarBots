@@ -127,23 +127,142 @@ async def mass_broadcast_callback(callback: CallbackQuery, state: FSMContext):
     settings = db.get_mass_broadcast_settings()
     
     # Показуємо поточні налаштування
-    settings_text = f"⚙️ <b>Поточні налаштування масової розсилки:</b>\n\n"
+    settings_text = f"⚙️ <b>Поточні розсилки:</b>\n\n"
     settings_text += f"⏱️ <b>Інтервал:</b> {settings['interval_seconds']} секунд\n"
     if settings['use_random_interval']:
         settings_text += f"🎲 <b>Рандомний інтервал:</b> {settings['min_random_seconds']}-{settings['max_random_seconds']} секунд\n"
     else:
         settings_text += f"🎲 <b>Рандомний інтервал:</b> Вимкнено\n"
     settings_text += f"👥 <b>Аккаунтів:</b> {len(accounts)}\n\n"
-    settings_text += "📝 Введіть текст повідомлення або надішліть медіа-файл для масової розсилки:\n"
-    settings_text += "Для того щоб обрати різні повідомлення для аккаунтів, натисніть на кнопку 📝 Різні повідомлення для аккаунтів"
+    settings_text += "📝 Оберіть тип розсилки:\n"
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📝 Різні повідомлення для аккаунтів", callback_data="mass_different_messages")]
+        [InlineKeyboardButton(text="📝 Різні повідомлення для аккаунтів", callback_data="mass_different_messages")],
+        [InlineKeyboardButton(text="1 повідомлення для всіх аккаунтів", callback_data="mass_one_message_for_all_accounts")]
     ])
 
     await callback.message.answer(settings_text, parse_mode='HTML', reply_markup=keyboard)
     await state.set_state(MassBroadcastStates.waiting_for_message)
     await callback.answer()
+#====================== ЗАГАЛЬНА РОЗСИЛКА 1 ПОВІДОМЛЕННЯ ДЛЯ ВСІХ АККАУНТІВ ======================
+
+@router.callback_query(lambda c: c.data == "mass_one_message_for_all_accounts")
+async def mass_one_message_for_all_accounts_callback(callback: CallbackQuery, state: FSMContext):
+    """Обробка натискання кнопки 1 повідомлення для всіх аккаунтів"""
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Текстове повідомлення", callback_data="one_message_type_text")],
+        [InlineKeyboardButton(text="🖼️ Фото", callback_data="one_message_type_photo")],
+        [InlineKeyboardButton(text="🎵 Аудіо", callback_data="one_message_type_audio")],
+        [InlineKeyboardButton(text="🎬 Відео", callback_data="one_message_type_video")],
+        [InlineKeyboardButton(text="📄 Документ", callback_data="one_message_type_document")],
+        [InlineKeyboardButton(text="🎬 Гіфка", callback_data="one_message_type_animation")],
+        [InlineKeyboardButton(text="🎭 Стікер", callback_data="one_message_type_sticker")],
+        [InlineKeyboardButton(text="🎤 Голосове", callback_data="one_message_type_voice")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="Mass_broadcast")]
+    ])
+
+    await callback.message.answer("Оберіть тип розсилки:", parse_mode='HTML', reply_markup=keyboard)
+    await state.set_state(MassBroadcastStates.waiting_for_message)
+    await callback.answer()
+    
+
+@router.callback_query(lambda c: c.data.startswith("one_message_type_"))
+async def process_one_message_type_callback(callback: CallbackQuery, state: FSMContext):
+    """Обробка вибору типу повідомлення для всіх аккаунтів"""
+    message_type = callback.data.replace("one_message_type_", "")
+    
+    # Зберігаємо тип повідомлення
+    await state.update_data(message_type=message_type)
+    
+    if message_type == "text":
+        await callback.message.answer("📝 Введіть текст повідомлення для всіх аккаунтів:")
+        await state.set_state(MassBroadcastStates.waiting_for_message)
+    elif message_type in ["sticker", "voice"]:
+        # Для стікерів та голосових повідомлень не потрібен підпис
+        await callback.message.answer("📎 Завантажте файл:")
+        await state.set_state(MassBroadcastStates.waiting_for_message)
+    else:
+        # Для медіа-файлів
+        media_type_names = {
+            'photo': 'фото',
+            'video': 'відео', 
+            'audio': 'аудіо',
+            'document': 'документ',
+            'animation': 'гіфку'
+        }
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📝 З підписом", callback_data="media_with_caption")],
+            [InlineKeyboardButton(text="📎 Без підпису", callback_data="media_no_caption")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="Mass_broadcast")]])    
+        await callback.message.answer(
+            f"📎 Завантажте {media_type_names.get(message_type, message_type)} для всіх аккаунтів:",
+            parse_mode='HTML',
+            reply_markup=keyboard
+        )
+        await state.set_state(MassBroadcastStates.waiting_for_message)
+    await callback.answer()
+
+
+@router.message(MassBroadcastStates.waiting_for_media_caption)
+async def process_mass_one_media_caption(message: Message, state: FSMContext):
+    """Обробка підпису для медіа"""
+    caption = message.text.strip()
+    data = await state.get_data()
+    phone = data.get('selected_account_for_message')
+    message_type = data.get('message_type')
+    file_path = data.get('media_file_path')
+    file_id = data.get('media_file_id')
+        
+    if not caption:
+        await message.answer("❌ Підпис не може бути порожнім. Спробуйте ще раз:")
+        return
+    
+    if phone:
+        # Це підпис для конкретного аккаунта
+        # Зберігаємо повідомлення з підписом
+        await save_account_message(state, phone, message_type, file_path, caption, file_id)
+        
+        # Видаляємо аккаунт зі списку після завершення налаштування
+        accounts_to_configure = data.get('accounts_to_configure', [])
+        accounts_to_configure = [acc for acc in accounts_to_configure if acc['phone_number'] != phone]
+        await state.update_data(accounts_to_configure=accounts_to_configure)
+        
+        await message.answer(f"✅ Підпис для аккаунта {phone} збережено!")
+        await show_remaining_accounts(message, state)
+    else:
+        # Це загальний підпис для масової розсилки
+        await state.update_data(text=caption)
+        await show_interval_settings(message, state)
+
+@router.callback_query(lambda c: c.data in ["media_no_caption", "media_with_caption"])
+async def process_media_caption_callback(callback: CallbackQuery, state: FSMContext):
+    """Обробка вибору підпису для медіа"""
+    has_caption = callback.data == "media_with_caption"
+    data = await state.get_data()
+    message_type = data.get('message_type')
+    
+    # Зберігаємо інформацію про підпис
+    await state.update_data(has_caption=has_caption)
+    
+    media_type_names = get_media_type_names()
+
+    if has_caption:
+        await callback.message.answer(
+            f"📎 <b>Завантажте {media_type_names[message_type]} для аккаунта:</b>\n\n"
+            f"📝 Після завантаження файлу введіть підпис:",
+            parse_mode='HTML'
+        )
+    else:
+        await callback.message.answer(
+            f"📎 <b>Завантажте {media_type_names[message_type]} для аккаунта:</b>\n\n"
+            f"📎 Файл буде відправлено без підпису:",
+            parse_mode='HTML'
+        )
+    
+    await state.set_state(MassBroadcastStates.waiting_for_media_file)
+    await callback.answer()
+
+
 
 @router.message(MassBroadcastStates.waiting_for_message)
 async def process_mass_broadcast_message(message: Message, state: FSMContext):
@@ -163,6 +282,13 @@ async def process_mass_broadcast_message(message: Message, state: FSMContext):
         
         # Зберігаємо текст повідомлення
         await state.update_data(message_text=message_text)
+        data = await state.get_data()
+        is_one_message_for_all = not data.get('account_messages')
+
+        if is_one_message_for_all:
+            # Для одного повідомлення для всіх аккаунтів переходимо до налаштування інтервалів
+            await show_interval_settings(message, state)
+            return 
         
         # Показуємо кнопки для вибору типу розсилки
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -171,8 +297,8 @@ async def process_mass_broadcast_message(message: Message, state: FSMContext):
         ])
         
         await message.answer(
-            f"📝 <b>Повідомлення:</b> {message_text[:100]}{'...' if len(message_text) > 100 else ''}\n\n"
-            f"Оберіть тип розсилки:",
+            f"📝 <b>Повідомлення!:</b> {message_text[:100]}{'...' if len(message_text) > 100 else ''}\n\n"
+            f"Помилка треба обрати тип розсилки:",
             parse_mode='HTML',
             reply_markup=keyboard
         )
@@ -206,6 +332,7 @@ async def process_mass_media_file(message: Message, state: FSMContext):
     # Отримуємо дані з state
     data = await state.get_data()
     phone = data.get('selected_phone', 'mass_broadcast')
+
     
     # Обробляємо медіа-файл
     file_id, file_path = await process_media_file_common(message, message_type, phone, media_dir)
@@ -223,6 +350,15 @@ async def process_mass_media_file(message: Message, state: FSMContext):
 
     
     await state.update_data(**update_data)
+    
+    # Перевіряємо чи це повідомлення для всіх аккаунтів
+    data = await state.get_data()
+    is_one_message_for_all = not data.get('account_messages')
+    
+    if is_one_message_for_all:
+        # Для одного повідомлення для всіх аккаунтів переходимо до налаштування інтервалів
+        await show_interval_settings(message, state)
+        return  # Важливо! Виходимо з функції
     
     # Показуємо кнопки для вибору підпису
     keyboard, media_type_display = await handle_media_type_selection(message_type, is_mass_broadcast=True)
@@ -251,22 +387,20 @@ async def process_mass_media_caption_callback(callback: CallbackQuery, state: FS
     data = await state.get_data()
     message_type = data.get('message_type')
     
-    # Зберігаємо інформацію про підпис
+# Зберігаємо інформацію про підпис
     await state.update_data(has_caption=has_caption)
     
     media_type_names = get_media_type_names()
-    
     if has_caption:
-        await callback.message.answer(
-            f"📝 <b>Введіть підпис для {media_type_names[message_type]}:</b>\n\n"
-            f"📎 Цей підпис буде додано до всіх медіа-файлів у розсилці",
-            parse_mode='HTML'
-        )
-        await state.set_state(MassBroadcastStates.waiting_for_media_caption)
+       await callback.message.answer(
+          f"📝 <b>Введіть підпис для {media_type_names[message_type]}:</b>\n\n"
+          f"📎 Цей підпис буде додано до всіх медіа-файлів у розсилці",
+          parse_mode='HTML'
+       )
+       await state.set_state(MassBroadcastStates.waiting_for_media_caption)
     else:
-        # Без підпису - переходимо до налаштування інтервалів
+      # Без підпису - переходимо до налаштування інтервалів
         await show_interval_settings(callback, state)
-    
     await callback.answer()
 
 @router.message(MassBroadcastStates.waiting_for_media_caption)
@@ -1305,6 +1439,7 @@ async def confirm_loop_broadcast_callback(callback: CallbackQuery, state: FSMCon
     # Логуємо всі дані FSM перед визначенням інтервалу
     logger.info(f"🔍 FSM дані в confirm_loop_broadcast_callback: use_random_cycle_interval={data.get('use_random_cycle_interval')}, cycle_interval={data.get('cycle_interval')}, cycle_interval_min={data.get('cycle_interval_min')}, cycle_interval_max={data.get('cycle_interval_max')}, interval={data.get('interval')}")
     
+
     # Визначаємо інтервал для циклічної розсилки
     if data.get('use_random_cycle_interval'):
         # Використовуємо рандомний інтервал циклу
@@ -1314,7 +1449,7 @@ async def confirm_loop_broadcast_callback(callback: CallbackQuery, state: FSMCon
         logger.info(f"🎲 Використовуємо рандомний інтервал циклу: {interval} сек (діапазон: {cycle_min}-{cycle_max})")
     else:
         # Використовуємо фіксований інтервал
-        interval = data.get('cycle_interval', data.get('interval', 60))
+        interval = data.get('cycle_interval') or data.get('interval') or 60
         logger.info(f"⏳ Використовуємо інтервал: {interval} сек (cycle_interval={data.get('cycle_interval')}, interval={data.get('interval')})")
     
     # Перевіряємо чи є басейни для розсилки
@@ -1734,6 +1869,7 @@ async def mass_broadcast_process(message_text, interval: int, use_random: bool,
                             logger.error(f"❌ FloodWait Error в масовій розсилці: {flood_error}")
                             logger.error(f"⏳ FloodWait: {flood_error.seconds} секунд для групи {group['name']}")
                             logger.info(f"📊 Статистика після FloodWait: відправлено={total_sent}, невдало={total_failed}")
+                            logger.info(f"🧪 FloodWaitError оброблено в mass_broadcast.py, переходимо до наступної групи")
                             break
                         
                         except Exception as e:
@@ -1804,7 +1940,7 @@ async def mass_broadcast_process(message_text, interval: int, use_random: bool,
                 else:
                     # Fallback до FSM даних
                     data = await state.get_data()
-                    delay = data.get('interval', interval)
+                    delay = data.get('interval') or interval or 60
                     logger.info(f"⏳ Fallback інтервал між аккаунтами: {delay} сек (data.interval={data.get('interval')}, param.interval={interval})")
                 await asyncio.sleep(delay)
                 
@@ -1979,7 +2115,7 @@ async def loop_broadcast_process(message_text, interval: int, use_random: bool,
         cycle_count = 0
         
         logger.info(f"🚀 Початок циклічної розсилки: {len(accounts)} аккаунтів, {len(groups_to_send)} груп")
-    
+
         # Циклічна розсилка: кожен аккаунт відправляє по всіх своїх басейнах, потім перехід до наступного
         while True:
             # Перевіряємо флаг зупинки на початку кожного циклу
@@ -2100,6 +2236,7 @@ async def loop_broadcast_process(message_text, interval: int, use_random: bool,
                                     total_sent += 1
                                     logger.info(f"✅ Повідомлення успішно відправлено в групу {group['name']} ({group_id})")
                                     logger.info(f"📊 Статистика: відправлено={total_sent}, невдало={total_failed}")
+
                                 else:
                                     total_failed += 1
                                     logger.warning(f"⚠️ Не вдалося відправити повідомлення в групу {group['name']} ({group_id})")
@@ -2136,6 +2273,7 @@ async def loop_broadcast_process(message_text, interval: int, use_random: bool,
                                 
                                 break  # Успішно відправлено, виходимо з циклу retry
                                     
+                                    
                             except FloodWaitError as flood_error:
                                 # FloodWait обробляється в database.py
                                 total_failed += 1
@@ -2143,6 +2281,7 @@ async def loop_broadcast_process(message_text, interval: int, use_random: bool,
                                 logger.error(f"⏳ FloodWait: {flood_error.seconds} секунд для групи {group['name']}")
                                 logger.info(f"Чекаємо {flood_error.seconds} секунд")
                                 logger.info(f"📊 Статистика після FloodWait: відправлено={total_sent}, невдало={total_failed}")
+                                logger.info(f"🧪 FloodWaitError оброблено в циклічній розсилці, переходимо до наступної групи")
                                 break
                                     
                             except Exception as e:
@@ -2199,7 +2338,7 @@ async def loop_broadcast_process(message_text, interval: int, use_random: bool,
                         else:
                             # Fallback до FSM даних
                             data = await state.get_data()
-                            delay = data.get('interval', interval)
+                            delay = data.get('interval') or interval or 60
                             logger.info(f"⏳ Fallback інтервал між аккаунтами: {delay} сек (data.interval={data.get('interval')}, param.interval={interval})")
                         await message_obj.answer(f"⏳ <b>Затримка між аккаунтами:</b>\n\n"
                                                f"🕐 <b>Чекаємо:</b> {delay} секунд\n"
@@ -2230,18 +2369,18 @@ async def loop_broadcast_process(message_text, interval: int, use_random: bool,
                 if cycle_interval_data.get('use_random_cycle_interval'):
                     # Використовуємо рандомний інтервал циклу
                     cycle_min = cycle_interval_data.get('cycle_interval_min', 30)
-                    cycle_max = cycle_interval_data.get('cycle_interval_max', 120)
+                    cycle_max = cycle_interval_data.get('cycle_interval_max', 60)
                     delay = random.randint(cycle_min, cycle_max)
                     logger.info(f"🎲 Згенеровано рандомний інтервал між циклами: {delay} секунд (діапазон: {cycle_min}-{cycle_max})")
                 else:
                     # Використовуємо фіксований інтервал
-                    delay = cycle_interval_data.get('cycle_interval', 60)
+                    delay = cycle_interval_data.get('cycle_interval') or 60
                     logger.info(f"⏳ Фіксований інтервал між циклами: {delay} секунд")
             else:
                 # Fallback до FSM даних (якщо cycle_interval_data не передано)
                 data = await state.get_data()
                 logger.info(f"🔍 Fallback до FSM даних: use_random_cycle_interval={data.get('use_random_cycle_interval')}, cycle_interval={data.get('cycle_interval')}")
-                delay = data.get('cycle_interval', data.get('interval', 60))
+                delay = data.get('cycle_interval') or data.get('interval') or 60
                 logger.info(f"⏳ Fallback інтервал між циклами: {delay} секунд")
             
             logger.info(f"📊 Статистика циклу #{cycle_count}: відправлено={total_sent}, невдало={total_failed}")
@@ -2269,7 +2408,7 @@ async def loop_broadcast_process(message_text, interval: int, use_random: bool,
                                        parse_mode='HTML')
             
             await asyncio.sleep(delay)
-        
+
     except Exception as e:  # except для try блоку на лінії 1586
         logger.error(f"❌ Критична помилка в циклічній розсилці: {e}")
         logger.error(f"📊 Фінальна статистика: відправлено={total_sent if 'total_sent' in locals() else 0}, невдало={total_failed if 'total_failed' in locals() else 0}")

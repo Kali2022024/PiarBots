@@ -469,6 +469,14 @@ class Database:
                 # Імітуємо друк
                 await simulate_typing(client, entity)
                 
+                # ШТУЧНА ПОМИЛКА ДЛЯ ТЕСТУВАННЯ - FloodWait(400)
+                #if attempt == 0:  # Тільки на першій спробі
+                #    logger.info("🧪 ТЕСТ: Викликаємо штучну FloodWait(400) помилку")
+                #   from telethon.errors import FloodWaitError
+                #    test_error = FloodWaitError(420, 1)  # 420 - код помилки, 400 - секунди
+                #    logger.info(f"🧪 ТЕСТ: Створено FloodWaitError з seconds={test_error.seconds}")
+                #    raise test_error
+                
                 # Обробляємо різні типи повідомлень
                 if isinstance(message_data, str):
                     # Старий формат - просто текст
@@ -542,9 +550,9 @@ class Database:
                             if message_type == 'photo':
                                 await client.send_file(entity, media_source, caption=caption)
                             elif message_type == 'video':
-                                await client.send_file(entity, media_source, caption=caption, video_note=False)
+                                await client.send_file(entity, media_source, caption=caption, video_note=True)
                             elif message_type == 'audio':
-                                await client.send_file(entity, media_source, caption=caption, voice_note=False)
+                                await client.send_file(entity, media_source, caption=caption, voice_note=True)
                             elif message_type == 'animation':
                                 await client.send_file(entity, media_source, caption=caption)
                             elif message_type == 'voice':
@@ -577,10 +585,11 @@ class Database:
                 
             except FloodWaitError as flood_error:
                 # Обробка FloodWaitError
-                random_time = random.randint(10, 50)
+                random_time = random.randint(300, 600)
                 wait_time = flood_error.seconds
                 total_wait = wait_time + random_time
                 logger.warning(f"⏳ FloodWait: чекаємо {total_wait} секунд, Flood wait: {wait_time}, Random time: {random_time}")
+                logger.info(f"🧪 flood_error.seconds = {flood_error.seconds}, type = {type(flood_error.seconds)}")
                 
                 # Відправляємо повідомлення в чат про FloodWait
                 try:
