@@ -99,6 +99,22 @@ class Database:
                 )
             """)
             
+            # Таблиця шаблонів повідомлень
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS templates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    message_type TEXT NOT NULL DEFAULT 'text',
+                    text TEXT,
+                    file_id TEXT,
+                    file_path TEXT,
+                    file_name TEXT,
+                    file_size INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
             # Додаємо міграцію для нових колонок інтервалів між повідомленнями
             try:
                 cursor.execute("ALTER TABLE mass_broadcast_settings ADD COLUMN message_interval_seconds INTEGER DEFAULT 10")
@@ -754,6 +770,37 @@ class Database:
             logger.error(f"❌ Помилка при створенні статусу розсилання: {e}")
             return 0
     
+    def set_broadcast_status(self, account_phone: str, message_text: str, total_groups: int, 
+                           sent_count: int = 0, failed_count: int = 0, status: str = 'running') -> int:
+        """Встановити статус розсилання (створює новий або оновлює існуючий)"""
+        try:
+            print(f"DEBUG: set_broadcast_status - account_phone: {account_phone}, message_text: {message_text}, total_groups: {total_groups}, status: {status}")
+            
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                # Спочатку очищаємо старі статуси для цього аккаунта
+                cursor.execute("""
+                    UPDATE broadcast_status 
+                    SET status = 'completed', finished_at = CURRENT_TIMESTAMP
+                    WHERE account_phone = ? AND status IN ('pending', 'running')
+                """, (account_phone,))
+                
+                # Створюємо новий статус
+                cursor.execute("""
+                    INSERT INTO broadcast_status 
+                    (account_phone, message_text, total_groups, sent_count, failed_count, status)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (account_phone, message_text, total_groups, sent_count, failed_count, status))
+                conn.commit()
+                
+                status_id = cursor.lastrowid
+                print(f"DEBUG: set_broadcast_status - створено статус з ID: {status_id}")
+                return status_id
+        except Exception as e:
+            logger.error(f"❌ Помилка при встановленні статусу розсилання: {e}")
+            return 0
+    
     def update_broadcast_status(self, status_id: int, sent_count: int = None, 
                               failed_count: int = None, status: str = None) -> bool:
         """Оновити статус розсилання"""
@@ -787,6 +834,148 @@ class Database:
         except Exception as e:
             logger.error(f"❌ Помилка при оновленні статусу розсилання: {e}")
             return False
+    
+    def update_broadcast_status_by_phone(self, account_phone: str, sent_count: int = None, 
+                                       failed_count: int = None, status: str = None) -> bool:
+        """Оновити статус розсилання за номером телефону"""
+        try:
+            print(f"DEBUG: update_broadcast_status_by_phone - account_phone: {account_phone}, sent_count: {sent_count}, failed_count: {failed_count}, status: {status}")
+            
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                updates = []
+                params = []
+                
+                if sent_count is not None:
+                    updates.append("sent_count = ?")
+                    params.append(sent_count)
+                
+                if failed_count is not None:
+                    updates.append("failed_count = ?")
+                    params.append(failed_count)
+                
+                if status is not None:
+                    updates.append("status = ?")
+                    params.append(status)
+                    if status in ['completed', 'failed']:
+                        updates.append("finished_at = CURRENT_TIMESTAMP")
+                
+                if updates:
+                    params.append(account_phone)
+                    query = f"UPDATE broadcast_status SET {', '.join(updates)} WHERE account_phone = ? AND status IN ('pending', 'running')"
+                    cursor.execute(query, params)
+                    updated_count = cursor.rowcount
+                    conn.commit()
+                    print(f"DEBUG: update_broadcast_status_by_phone - оновлено {updated_count} записів")
+                    return updated_count > 0
+                return False
+        except Exception as e:
+            logger.error(f"❌ Помилка при оновленні статусу розсилання за телефоном: {e}")
+            return False
+    
+    def is_account_broadcasting(self, account_phone: str) -> bool:
+        """Перевірити чи аккаунт зараз надсилає повідомлення"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                # Перевіряємо тільки записи не старші за 2 години
+                cursor.execute("""
+                    SELECT COUNT(*) FROM broadcast_status 
+                    WHERE account_phone = ? AND status IN ('pending', 'running')
+                    AND started_at > datetime('now', '-2 hours')
+                """, (account_phone,))
+                count = cursor.fetchone()[0]
+                
+                print(f"DEBUG: is_account_broadcasting - аккаунт {account_phone}: count = {count}")
+                
+                # Відладочна інформація
+                if count > 0:
+                    cursor.execute("""
+                        SELECT id, status, started_at, message_text FROM broadcast_status 
+                        WHERE account_phone = ? AND status IN ('pending', 'running')
+                        AND started_at > datetime('now', '-2 hours')
+                        ORDER BY started_at DESC
+                    """, (account_phone,))
+                    records = cursor.fetchall()
+                    print(f"DEBUG: Аккаунт {account_phone} має {count} активних розсилок (останні 2 години):")
+                    for record in records:
+                        print(f"  - ID: {record[0]}, Status: {record[1]}, Started: {record[2]}, Message: {record[3][:50]}...")
+                else:
+                    # Показуємо всі записи для цього аккаунта (включаючи старі)
+                    cursor.execute("""
+                        SELECT id, status, started_at, message_text FROM broadcast_status 
+                        WHERE account_phone = ? 
+                        ORDER BY started_at DESC
+                        LIMIT 5
+                    """, (account_phone,))
+                    all_records = cursor.fetchall()
+                    print(f"DEBUG: Аккаунт {account_phone} - останні 5 записів:")
+                    for record in all_records:
+                        print(f"  - ID: {record[0]}, Status: {record[1]}, Started: {record[2]}, Message: {record[3][:50]}...")
+                
+                return count > 0
+        except Exception as e:
+            logger.error(f"❌ Помилка при перевірці статусу аккаунта {account_phone}: {e}")
+            return False
+    
+    def cleanup_old_broadcast_statuses(self, hours_old: int = 24) -> int:
+        """Очистити старі статуси розсилки (старші за вказану кількість годин)"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                # Спочатку подивимося що є в базі
+                cursor.execute("""
+                    SELECT id, account_phone, status, started_at, message_text 
+                    FROM broadcast_status 
+                    WHERE status IN ('pending', 'running')
+                    ORDER BY started_at DESC
+                """)
+                old_records = cursor.fetchall()
+                
+                if old_records:
+                    print(f"DEBUG: Знайдено {len(old_records)} записів зі статусом pending/running:")
+                    for record in old_records:
+                        print(f"  - ID: {record[0]}, Phone: {record[1]}, Status: {record[2]}, Started: {record[3]}")
+                
+                # Очищаємо тільки записи старші за вказану кількість годин
+                cursor.execute("""
+                    UPDATE broadcast_status 
+                    SET status = 'completed', finished_at = CURRENT_TIMESTAMP
+                    WHERE status IN ('pending', 'running') 
+                    AND started_at < datetime('now', '-{} hours')
+                """.format(hours_old))
+                updated_count = cursor.rowcount
+                conn.commit()
+                
+                if updated_count > 0:
+                    print(f"DEBUG: Очищено {updated_count} старих статусів розсилки (старші за {hours_old} годин)")
+                
+                return updated_count
+        except Exception as e:
+            logger.error(f"❌ Помилка при очищенні старих статусів розсилки: {e}")
+            return 0
+    
+    def clear_account_broadcast_status(self, account_phone: str) -> int:
+        """Очистити статуси розсилки для конкретного аккаунта"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE broadcast_status 
+                    SET status = 'completed', finished_at = CURRENT_TIMESTAMP
+                    WHERE account_phone = ? AND status IN ('pending', 'running')
+                """, (account_phone,))
+                updated_count = cursor.rowcount
+                conn.commit()
+                
+                if updated_count > 0:
+                    print(f"DEBUG: Очищено {updated_count} статусів розсилки для аккаунта {account_phone}")
+                
+                return updated_count
+        except Exception as e:
+            logger.error(f"❌ Помилка при очищенні статусів розсилки для аккаунта {account_phone}: {e}")
+            return 0
     
     def get_broadcast_statuses(self) -> list:
         """Отримати всі статуси розсилання"""
@@ -913,4 +1102,123 @@ class Database:
                 
         except Exception as e:
             logger.warning(f"⚠️ Помилка при відправці стікера: {e}")
+            return False
+    
+    # Методи для роботи з шаблонами
+    def add_template(self, name: str, message_type: str, text: str = None, 
+                    file_id: str = None, file_path: str = None, 
+                    file_name: str = None, file_size: int = None) -> int:
+        """Додати новий шаблон"""
+        try:
+            print(f"DEBUG: add_template called with:")
+            print(f"DEBUG: name: {name}")
+            print(f"DEBUG: message_type: {message_type}")
+            print(f"DEBUG: text: {text}")
+            print(f"DEBUG: file_id: {file_id}")
+            print(f"DEBUG: file_path: {file_path}")
+            print(f"DEBUG: file_name: {file_name}")
+            print(f"DEBUG: file_size: {file_size}")
+            
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO templates 
+                    (name, message_type, text, file_id, file_path, file_name, file_size)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (name, message_type, text, file_id, file_path, file_name, file_size))
+                conn.commit()
+                template_id = cursor.lastrowid
+                print(f"DEBUG: Template saved with ID: {template_id}")
+                return template_id
+        except Exception as e:
+            logger.error(f"❌ Помилка при додаванні шаблону: {e}")
+            return 0
+    
+    def get_templates(self) -> list:
+        """Отримати всі шаблони"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT * FROM templates 
+                    ORDER BY created_at DESC
+                """)
+                templates = []
+                for row in cursor.fetchall():
+                    templates.append(dict(row))
+                return templates
+        except Exception as e:
+            logger.error(f"❌ Помилка при отриманні шаблонів: {e}")
+            return []
+    
+    def get_template(self, template_id: int) -> dict:
+        """Отримати конкретний шаблон за ID"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM templates WHERE id = ?", (template_id,))
+                row = cursor.fetchone()
+                if row:
+                    return dict(row)
+                return None
+        except Exception as e:
+            logger.error(f"❌ Помилка при отриманні шаблону: {e}")
+            return None
+    
+    def update_template(self, template_id: int, name: str = None, message_type: str = None,
+                       text: str = None, file_id: str = None, file_path: str = None,
+                       file_name: str = None, file_size: int = None) -> bool:
+        """Оновити шаблон"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                updates = []
+                params = []
+                
+                if name is not None:
+                    updates.append("name = ?")
+                    params.append(name)
+                if message_type is not None:
+                    updates.append("message_type = ?")
+                    params.append(message_type)
+                if text is not None:
+                    updates.append("text = ?")
+                    params.append(text)
+                if file_id is not None:
+                    updates.append("file_id = ?")
+                    params.append(file_id)
+                if file_path is not None:
+                    updates.append("file_path = ?")
+                    params.append(file_path)
+                if file_name is not None:
+                    updates.append("file_name = ?")
+                    params.append(file_name)
+                if file_size is not None:
+                    updates.append("file_size = ?")
+                    params.append(file_size)
+                
+                if updates:
+                    updates.append("updated_at = CURRENT_TIMESTAMP")
+                    params.append(template_id)
+                    query = f"UPDATE templates SET {', '.join(updates)} WHERE id = ?"
+                    cursor.execute(query, params)
+                    conn.commit()
+                    return True
+                return False
+        except Exception as e:
+            logger.error(f"❌ Помилка при оновленні шаблону: {e}")
+            return False
+    
+    def delete_template(self, template_id: int) -> bool:
+        """Видалити шаблон"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM templates WHERE id = ?", (template_id,))
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"❌ Помилка при видаленні шаблону: {e}")
             return False

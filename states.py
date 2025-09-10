@@ -41,6 +41,8 @@ class MassBroadcastStates(StatesGroup):
     waiting_for_media_caption = State()
     waiting_for_single_group_id = State()
     waiting_for_cycle_interval = State()
+    waiting_for_template_message = State()
+    waiting_for_template_name = State()
 
 class DeletePackageStates(StatesGroup):
     waiting_for_package_name = State()

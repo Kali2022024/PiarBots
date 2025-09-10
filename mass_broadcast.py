@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import random
+import sqlite3
 from aiogram import Router
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
@@ -10,6 +11,7 @@ from telethon import TelegramClient
 from telethon.errors import FloodWaitError
 from states import MassBroadcastStates
 from utils import download_media_file
+from templates import TemplateManager
 
 # Налаштування логування
 logger = logging.getLogger(__name__)
@@ -17,15 +19,223 @@ logger = logging.getLogger(__name__)
 # Створюємо роутер для масової розсилки
 router = Router()
 
+async def handle_stop_message_command(message: Message, state: FSMContext):
+    """Універсальна обробка команди /stop_message"""
+    # Парсимо команду
+    command_parts = message.text.strip().split()
+    
+    if len(command_parts) == 1:
+        # Зупиняємо всі розсилки
+        await state.update_data(stop_broadcast=True)
+        
+        try:
+            with sqlite3.connect(db.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE broadcast_status 
+                    SET status = 'completed', finished_at = CURRENT_TIMESTAMP
+                    WHERE status IN ('pending', 'running')
+                """)
+                updated_count = cursor.rowcount
+                conn.commit()
+                
+            if updated_count > 0:
+                await message.answer(f"🛑 <b>Команда зупинки всіх розсилок отримана!</b>\n\n"
+                                   f"✅ Зупинено {updated_count} активних розсилок\n"
+                                   f"🔄 Циклічні розсилки будуть зупинені після завершення поточного циклу\n\n"
+                                   f"📊 Всі аккаунти тепер доступні для нових розсилок.",
+                                   parse_mode='HTML')
+            else:
+                await message.answer("🛑 <b>Команда зупинки всіх розсилок отримана!</b>\n\n"
+                                   "ℹ️ Активних розсилок не знайдено\n"
+                                   "🔄 Циклічні розсилки будуть зупинені після завершення поточного циклу",
+                                   parse_mode='HTML')
+        except Exception as e:
+            logger.error(f"❌ Помилка при зупинці всіх розсилок: {e}")
+            await message.answer("🛑 <b>Команда зупинки всіх розсилок отримана!</b>\n\n"
+                               "⚠️ Помилка при очищенні статусів, але флаг зупинки встановлено",
+                               parse_mode='HTML')
+    
+    elif len(command_parts) == 2:
+        # Зупиняємо розсилку конкретного аккаунта
+        phone_number = command_parts[1]
+        
+        # Перевіряємо чи аккаунт існує
+        accounts = db.get_accounts()
+        account_exists = any(acc['phone_number'] == phone_number for acc in accounts)
+        
+        if not account_exists:
+            await message.answer(f"❌ <b>Аккаунт не знайдено!</b>\n\n"
+                               f"📱 Номер: {phone_number}\n"
+                               f"ℹ️ Перевірте правильність номера телефону",
+                               parse_mode='HTML')
+            return True
+        
+        try:
+            with sqlite3.connect(db.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE broadcast_status 
+                    SET status = 'completed', finished_at = CURRENT_TIMESTAMP
+                    WHERE account_phone = ? AND status IN ('pending', 'running')
+                """, (phone_number,))
+                updated_count = cursor.rowcount
+                conn.commit()
+            
+            # Відключаємо клієнт Telegram для цього аккаунта
+            disconnect_success = await disconnect_account_client(phone_number)
+                
+            if updated_count > 0:
+                disconnect_info = "🔌 Клієнт відключений" if disconnect_success else "⚠️ Клієнт не відключений"
+                await message.answer(f"🛑 <b>Команда зупинки розсилки аккаунта отримана!</b>\n\n"
+                                   f"📱 <b>Аккаунт:</b> {phone_number}\n"
+                                   f"✅ Зупинено {updated_count} активних розсилок\n"
+                                   f"{disconnect_info}\n\n"
+                                   f"📊 Аккаунт тепер доступний для нових розсилок.",
+                                   parse_mode='HTML')
+            else:
+                disconnect_info = "🔌 Клієнт відключений" if disconnect_success else "⚠️ Клієнт не відключений"
+                await message.answer(f"🛑 <b>Команда зупинки розсилки аккаунта отримана!</b>\n\n"
+                                   f"📱 <b>Аккаунт:</b> {phone_number}\n"
+                                   f"ℹ️ Активних розсилок для цього аккаунта не знайдено\n"
+                                   f"{disconnect_info}",
+                                   parse_mode='HTML')
+        except Exception as e:
+            logger.error(f"❌ Помилка при зупинці розсилки аккаунта {phone_number}: {e}")
+            await message.answer(f"🛑 <b>Команда зупинки розсилки аккаунта отримана!</b>\n\n"
+                               f"📱 <b>Аккаунт:</b> {phone_number}\n"
+                               f"⚠️ Помилка при очищенні статусів",
+                               parse_mode='HTML')
+    
+    else:
+        # Невірний формат команди
+        await message.answer("❌ <b>Невірний формат команди!</b>\n\n"
+                           "📝 <b>Правильні формати:</b>\n"
+                           "• <code>/stop_message</code> - зупинити всі розсилки\n"
+                           "• <code>/stop_message +380123456789</code> - зупинити розсилку конкретного аккаунта",
+                           parse_mode='HTML')
+    
+    return True
+
+async def disconnect_account_client(account_phone: str) -> bool:
+    """Відключити клієнт Telegram для конкретного аккаунта"""
+    try:
+        # Спочатку перевіряємо реєстр активних клієнтів
+        global active_clients
+        if account_phone in active_clients:
+            client = active_clients[account_phone]
+            if client.is_connected():
+                logger.info(f"🔌 Знайдено активний клієнт в реєстрі для аккаунта {account_phone}, відключаємо...")
+                await client.disconnect()
+                unregister_active_client(account_phone)
+                logger.info(f"✅ Активний клієнт з реєстру для аккаунта {account_phone} відключений")
+        
+        # Також перевіряємо чи є клієнт через database.py
+        existing_client = db.get_client(account_phone) if hasattr(db, 'get_client') else None
+        
+        if existing_client and existing_client.is_connected():
+            logger.info(f"🔌 Знайдено активний клієнт через DB для аккаунта {account_phone}, відключаємо...")
+            await existing_client.disconnect()
+            logger.info(f"✅ Активний клієнт через DB для аккаунта {account_phone} відключений")
+        
+        # Створюємо всі можливі імена сесій для аккаунта
+        phone_clean = account_phone.replace('+', '').replace('-', '')
+        session_names = [
+            f"sessions/temp_{phone_clean}",
+            f"session_{phone_clean}",
+            f"session_{account_phone}",
+            f"session.session"  # загальна сесія
+        ]
+        
+        # Отримуємо дані аккаунта
+        accounts = db.get_accounts()
+        account = None
+        for acc in accounts:
+            if acc['phone_number'] == account_phone:
+                account = acc
+                break
+        
+        if not account:
+            logger.warning(f"⚠️ Аккаунт {account_phone} не знайдено для відключення")
+            return False
+        
+        disconnected_any = False
+        
+        # Пробуємо відключити всі можливі сесії
+        for session_name in session_names:
+            try:
+                logger.info(f"🔍 Перевіряємо сесію: {session_name}")
+                
+                # Створюємо клієнт для кожної можливої сесії
+                client = TelegramClient(session_name, account['api_id'], account['api_hash'])
+                
+                # Підключаємося щоб перевірити стан
+                await client.connect()
+                
+                if await client.is_user_authorized():
+                    logger.info(f"🔌 Відключаємо авторизований клієнт: {session_name}")
+                    await client.disconnect()
+                    disconnected_any = True
+                    logger.info(f"✅ Клієнт {session_name} успішно відключений")
+                else:
+                    await client.disconnect()
+                    logger.info(f"ℹ️ Клієнт {session_name} не авторизований")
+                    
+            except Exception as session_error:
+                logger.warning(f"⚠️ Помилка при роботі з сесією {session_name}: {session_error}")
+                continue
+        
+        if disconnected_any:
+            logger.info(f"✅ Відключено активні сесії для аккаунта {account_phone}")
+            return True
+        else:
+            logger.info(f"ℹ️ Не знайдено активних сесій для аккаунта {account_phone}")
+            return True  # Повертаємо True, оскільки мета досягнута - немає активних з'єднань
+            
+    except Exception as e:
+        logger.error(f"❌ Помилка при відключенні клієнта для аккаунта {account_phone}: {e}")
+        return False
+
 # Глобальні змінні (будуть імпортовані з основного файлу)
 db = None
 bot = None
+template_manager = None
+
+# Глобальний реєстр активних клієнтів
+active_clients = {}
+
+def register_active_client(account_phone: str, client):
+    """Реєструємо активний клієнт"""
+    global active_clients
+    active_clients[account_phone] = client
+    logger.info(f"📋 Зареєстровано активний клієнт для {account_phone}")
+
+def unregister_active_client(account_phone: str):
+    """Видаляємо клієнт з реєстру"""
+    global active_clients
+    if account_phone in active_clients:
+        del active_clients[account_phone]
+        logger.info(f"📋 Видалено клієнт з реєстру для {account_phone}")
+
+async def disconnect_all_active_clients():
+    """Відключити всі активні клієнти"""
+    global active_clients
+    for account_phone, client in list(active_clients.items()):
+        try:
+            if client.is_connected():
+                await client.disconnect()
+                logger.info(f"✅ Відключено активний клієнт для {account_phone}")
+        except Exception as e:
+            logger.error(f"❌ Помилка відключення клієнта {account_phone}: {e}")
+        finally:
+            unregister_active_client(account_phone)
 
 def init_mass_broadcast_module(database, telegram_bot):
     """Ініціалізація модуля масової розсилки"""
-    global db, bot
+    global db, bot, template_manager
     db = database
     bot = telegram_bot
+    template_manager = TemplateManager(telegram_bot)
 
 def get_media_type_names():
     """Повертає словник назв типів медіа"""
@@ -158,6 +368,7 @@ async def mass_one_message_for_all_accounts_callback(callback: CallbackQuery, st
         [InlineKeyboardButton(text="🎬 Гіфка", callback_data="one_message_type_animation")],
         [InlineKeyboardButton(text="🎭 Стікер", callback_data="one_message_type_sticker")],
         [InlineKeyboardButton(text="🎤 Голосове", callback_data="one_message_type_voice")],
+        [InlineKeyboardButton(text="📋 Шаблони", callback_data="one_message_type_template")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="Mass_broadcast")]
     ])
 
@@ -177,6 +388,22 @@ async def process_one_message_type_callback(callback: CallbackQuery, state: FSMC
     if message_type == "text":
         await callback.message.answer("📝 Введіть текст повідомлення для всіх аккаунтів:")
         await state.set_state(MassBroadcastStates.waiting_for_message)
+    elif message_type == "template":
+        # Показуємо шаблони
+        templates = template_manager.db.get_templates()
+        if templates:
+            keyboard = template_manager.get_template_keyboard(templates)
+            await callback.message.answer(
+                "📋 <b>Оберіть шаблон для розсилки:</b>",
+                parse_mode='HTML',
+                reply_markup=keyboard
+            )
+        else:
+            await callback.message.answer(
+                "❌ <b>Шаблони не знайдені</b>\n\n"
+                "Спочатку створіть шаблон, відправивши повідомлення боту з командою /add_template",
+                parse_mode='HTML'
+            )
     elif message_type in ["sticker", "voice"]:
         # Для стікерів та голосових повідомлень не потрібен підпис
         await callback.message.answer("📎 Завантажте файл:")
@@ -267,6 +494,40 @@ async def process_media_caption_callback(callback: CallbackQuery, state: FSMCont
 @router.message(MassBroadcastStates.waiting_for_message)
 async def process_mass_broadcast_message(message: Message, state: FSMContext):
     """Обробка повідомлення для масової розсилки (текст або медіа)"""
+    
+    # Перевіряємо чи це команда /stop_message
+    if message.text and message.text.strip() == "/stop_message":
+        await handle_stop_message_command(message, state)
+        return
+    
+    # Перевіряємо чи це шаблон
+    current_state = await state.get_state()
+    if current_state == MassBroadcastStates.waiting_for_template_message:
+        # Зберігаємо повідомлення як шаблон
+        await state.update_data(template_message=message)
+        await message.answer("📝 Введіть назву для шаблону:")
+        await state.set_state(MassBroadcastStates.waiting_for_template_name)
+        return
+    elif current_state == MassBroadcastStates.waiting_for_template_name:
+        # Зберігаємо шаблон в базу даних
+        data = await state.get_data()
+        template_message = data.get('template_message')
+        template_name = message.text.strip()
+        
+        if not template_name:
+            await message.answer("❌ Назва шаблону не може бути порожньою. Спробуйте ще раз:")
+            return
+        
+        # Зберігаємо шаблон
+        success = await template_manager.save_template_from_message(template_message, template_name)
+        
+        if success:
+            await message.answer(f"✅ Шаблон '{template_name}' успішно збережено!")
+        else:
+            await message.answer("❌ Помилка при збереженні шаблону. Спробуйте ще раз.")
+        
+        await state.clear()
+        return
     
     # Перевіряємо чи це медіа-файл
     if message.photo or message.video or message.audio or message.document or message.animation or message.sticker or message.voice:
@@ -493,43 +754,146 @@ async def show_remaining_accounts(message: Message, state: FSMContext):
     accounts_to_configure = data.get('accounts_to_configure', [])
     account_messages = data.get('account_messages', {})
     
+    # Очищуємо старі статуси розсилки (старші за 6 годин)
+    db.cleanup_old_broadcast_statuses(6)
+    
+    # Відладочна інформація
+    print(f"DEBUG: accounts_to_configure count: {len(accounts_to_configure)}")
+    print(f"DEBUG: account_messages count: {len(account_messages)}")
+    print(f"DEBUG: account_messages keys: {list(account_messages.keys())}")
+    
     if not accounts_to_configure:
         # Всі аккаунти налаштовані, переходимо до налаштування інтервалів
         await show_interval_settings(message, state)
         return
     
+    # Підраховуємо зайняті аккаунти
+    busy_accounts = []
+    available_accounts = []
+    for account in accounts_to_configure:
+        phone = account['phone_number']
+        is_broadcasting = db.is_account_broadcasting(phone)
+        print(f"DEBUG: show_remaining_accounts - аккаунт {phone}: is_broadcasting = {is_broadcasting}")
+        if is_broadcasting:
+            busy_accounts.append(phone)
+        else:
+            available_accounts.append(phone)
+    
+    print(f"DEBUG: show_remaining_accounts - busy_accounts: {busy_accounts}")
+    print(f"DEBUG: show_remaining_accounts - available_accounts: {available_accounts}")
+    
     # Показуємо список аккаунтів для вибору
     keyboard_buttons = []
     for account in accounts_to_configure:
-        button_text = f"📱 {account['phone_number']}"
-        keyboard_buttons.append([InlineKeyboardButton(
-            text=button_text,
-            callback_data=f"mass_account_message_{account['phone_number']}"
-        )])
+        phone = account['phone_number']
+        
+        # Перевіряємо чи аккаунт вже надсилає повідомлення
+        is_broadcasting = db.is_account_broadcasting(phone)
+        
+        if is_broadcasting:
+            button_text = f"🔴 {phone}"
+            # Аккаунт недоступний для вибору
+            keyboard_buttons.append([InlineKeyboardButton(
+                text=button_text,
+                callback_data="account_busy"
+            )])
+        else:
+            button_text = f"📱 {phone}"
+            keyboard_buttons.append([InlineKeyboardButton(
+                text=button_text,
+                callback_data=f"mass_account_message_{phone}"
+            )])
     
     # Додаємо кнопку запуску розсилки якщо є налаштовані повідомлення
     if len(account_messages) > 0:
         keyboard_buttons.append([InlineKeyboardButton(text="🚀 Запустити розсилку", callback_data="start_different_messages_broadcast")])
     
+    # Додаємо кнопку очищення статусів якщо є зайняті аккаунти
+    if busy_accounts:
+        keyboard_buttons.append([InlineKeyboardButton(text="🧹 Очистити статуси зайнятих аккаунтів", callback_data="clear_busy_accounts")])
+    
     keyboard_buttons.append([InlineKeyboardButton(text="✅ Завершити налаштування", callback_data="mass_finish_messages")])
     keyboard_buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="Mass_broadcast")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
     
+    # Показуємо детальну інформацію про налаштовані повідомлення
+    configured_info = ""
+    if account_messages:
+        configured_info = "\n\n📋 <b>Налаштовані повідомлення:</b>\n"
+        for phone, msg_data in account_messages.items():
+            msg_type = msg_data.get('type', 'unknown')
+            configured_info += f"• {phone}: {msg_type}\n"
+    
+    # Показуємо інформацію про зайняті аккаунти
+    busy_info = ""
+    if busy_accounts:
+        busy_info = f"\n\n🔴 <b>Зайняті аккаунти ({len(busy_accounts)}):</b>\n"
+        for phone in busy_accounts:
+            busy_info += f"• {phone}\n"
+    
     await message.answer(
         f"✅ <b>Повідомлення налаштовано для {len(account_messages)} аккаунтів</b>\n\n"
-        f"📱 Залишилося налаштувати: {len(accounts_to_configure)} аккаунтів\n\n"
+        f"📱 Доступно для налаштування: {len(available_accounts)} аккаунтів{configured_info}{busy_info}\n\n"
         f"Оберіть наступний аккаунт або запустіть розсилку:",
         parse_mode='HTML',
         reply_markup=keyboard
     )
+
+@router.callback_query(lambda c: c.data == "account_busy")
+async def account_busy_callback(callback: CallbackQuery, state: FSMContext):
+    """Обробка натискання на зайнятий аккаунт"""
+    await callback.message.answer(
+        "🔴 <b>Цей аккаунт зараз надсилає повідомлення!</b>\n\n"
+        "⏳ Зачекайте завершення поточної розсилки або оберіть інший аккаунт.",
+        parse_mode='HTML'
+    )
+    await callback.answer()
+
+@router.callback_query(lambda c: c.data == "clear_busy_accounts")
+async def clear_busy_accounts_callback(callback: CallbackQuery, state: FSMContext):
+    """Очистити статуси зайнятих аккаунтів"""
+    data = await state.get_data()
+    accounts_to_configure = data.get('accounts_to_configure', [])
+    
+    cleared_count = 0
+    for account in accounts_to_configure:
+        phone = account['phone_number']
+        if db.is_account_broadcasting(phone):
+            count = db.clear_account_broadcast_status(phone)
+            cleared_count += count
+    
+    if cleared_count > 0:
+        await callback.message.answer(
+            f"✅ <b>Очищено статуси для {cleared_count} розсилок!</b>\n\n"
+            f"Тепер всі аккаунти доступні для налаштування.",
+            parse_mode='HTML'
+        )
+        # Показуємо оновлений список аккаунтів
+        await show_remaining_accounts(callback.message, state)
+    else:
+        await callback.message.answer(
+            "ℹ️ <b>Немає статусів для очищення</b>\n\n"
+            "Всі аккаунти вже доступні.",
+            parse_mode='HTML'
+        )
+    
+    await callback.answer()
 
 @router.callback_query(lambda c: c.data.startswith("mass_account_message_"))
 async def process_mass_account_message_callback(callback: CallbackQuery, state: FSMContext):
     """Обробка вибору аккаунта для налаштування повідомлення"""
     account_phone = callback.data.replace("mass_account_message_", "")
     
+    # Відладочна інформація
+    print(f"DEBUG: Selected account for message: {account_phone}")
+    
     # Зберігаємо вибраний аккаунт
     await state.update_data(selected_account_for_message=account_phone)
+    
+    # Перевіряємо, що дані збереглися
+    data = await state.get_data()
+    saved_account = data.get('selected_account_for_message')
+    print(f"DEBUG: Saved selected_account_for_message: {saved_account}")
     
     # Показуємо кнопки для вибору типу повідомлення
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -541,6 +905,7 @@ async def process_mass_account_message_callback(callback: CallbackQuery, state: 
         [InlineKeyboardButton(text="🎬 Гіфка", callback_data="message_type_animation")],
         [InlineKeyboardButton(text="🎭 Стікер", callback_data="message_type_sticker")],
         [InlineKeyboardButton(text="🎤 Голосове", callback_data="message_type_voice")],
+        [InlineKeyboardButton(text="📋 Шаблони", callback_data="message_type_template")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="mass_different_messages")]
     ])
     
@@ -570,6 +935,22 @@ async def process_message_type_callback(callback: CallbackQuery, state: FSMConte
             parse_mode='HTML'
         )
         await state.set_state(MassBroadcastStates.waiting_for_account_message)
+    elif message_type == "template":
+        # Показуємо шаблони
+        templates = template_manager.db.get_templates()
+        if templates:
+            keyboard = template_manager.get_template_keyboard(templates)
+            await callback.message.answer(
+                f"📋 <b>Оберіть шаблон для аккаунта {phone}:</b>",
+                parse_mode='HTML',
+                reply_markup=keyboard
+            )
+        else:
+            await callback.message.answer(
+                "❌ <b>Шаблони не знайдені</b>\n\n"
+                "Спочатку створіть шаблон, відправивши повідомлення боту з командою /add_template",
+                parse_mode='HTML'
+            )
     else:
         # Для медіа-повідомлень
         # Показуємо опції для медіа
@@ -598,6 +979,9 @@ async def process_account_message(message: Message, state: FSMContext):
     data = await state.get_data()
     phone = data.get('selected_account_for_message')
     accounts_to_configure = data.get('accounts_to_configure', [])
+    
+    print(f"DEBUG: process_account_message - phone: {phone}")
+    print(f"DEBUG: process_account_message - text: {text}")
     
     if not phone:
         await message.answer("❌ Помилка: немає поточного аккаунта.")
@@ -700,9 +1084,19 @@ async def save_account_message(state: FSMContext, phone: str, message_type: str,
         'file_id': file_id
     }
     
+    # Відладочна інформація
+    print(f"DEBUG: Saving message for phone {phone}")
+    print(f"DEBUG: Message data: {message_data}")
+    print(f"DEBUG: Current account_messages before save: {list(account_messages.keys())}")
     
     account_messages[phone] = message_data
     await state.update_data(account_messages=account_messages)
+    
+    # Перевіряємо, що дані збереглися
+    updated_data = await state.get_data()
+    updated_account_messages = updated_data.get('account_messages', {})
+    print(f"DEBUG: account_messages after save: {list(updated_account_messages.keys())}")
+    print(f"DEBUG: Total messages saved: {len(updated_account_messages)}")
 
 @router.callback_query(lambda c: c.data == "start_different_messages_broadcast")
 async def start_different_messages_broadcast_callback(callback: CallbackQuery, state: FSMContext):
@@ -765,6 +1159,8 @@ async def show_interval_settings(message_or_callback, state: FSMContext):
     data = await state.get_data()
     message_text = data.get('message_text', '')
     account_messages = data.get('account_messages', {})
+    template_name = data.get('template_name', '')
+    template_id = data.get('template_id')
     
     # Отримуємо налаштування
     settings = db.get_mass_broadcast_settings()
@@ -788,6 +1184,9 @@ async def show_interval_settings(message_or_callback, state: FSMContext):
     if account_messages:
         # Різні повідомлення
         message_info = f"📝 <b>Різні повідомлення для {len(account_messages)} аккаунтів</b>"
+    elif template_name:
+        # Шаблон
+        message_info = f"📋 <b>Шаблон:</b> {template_name}\n💬 <b>Текст:</b> {message_text[:50]}{'...' if len(message_text) > 50 else ''}"
     else:
         # Однакове повідомлення
         message_info = f"📝 <b>Повідомлення:</b> {message_text[:50]}{'...' if len(message_text) > 50 else ''}"
@@ -829,7 +1228,19 @@ async def process_mass_interval_callback(callback: CallbackQuery, state: FSMCont
             data_check = await state.get_data()
             logger.info(f"🔍 Перевірка збереження: interval={data_check.get('interval')}, use_random={data_check.get('use_random')}")
             
-            await show_package_selection(callback, state)
+            # Перевіряємо чи це різні повідомлення
+            account_messages = data_check.get('account_messages', {})
+            if account_messages:
+                # Це різні повідомлення - зберігаємо дані і переходимо до вибору груп
+                await state.update_data(
+                    message_type='different_messages',
+                    message_text='Різні повідомлення для аккаунтів',
+                    account_messages=account_messages
+                )
+                await show_package_selection(callback, state)
+            else:
+                # Це загальна розсилка
+                await show_package_selection(callback, state)
         except ValueError:
             await callback.message.answer("❌ Невірний інтервал. Спробуйте ще раз.")
     
@@ -838,6 +1249,11 @@ async def process_mass_interval_callback(callback: CallbackQuery, state: FSMCont
 @router.message(MassBroadcastStates.waiting_for_interval)
 async def process_custom_interval(message: Message, state: FSMContext):
     """Обробка введення власного інтервалу (використовує існуючу логіку)"""
+    # Перевіряємо чи це команда /stop_message
+    if message.text and message.text.strip() == "/stop_message":
+        await handle_stop_message_command(message, state)
+        return
+    
     try:
         interval = int(message.text.strip())
         
@@ -1100,6 +1516,327 @@ async def skip_message_intervals_callback(callback: CallbackQuery, state: FSMCon
     await show_mass_broadcast_confirmation(callback, state)
     await callback.answer()
 
+@router.callback_query(lambda c: c.data.startswith("mass_different_select_package_"))
+async def process_different_messages_package_selection(callback: CallbackQuery, state: FSMContext):
+    """Обробка вибору пакету для розсилки різних повідомлень"""
+    package_id = int(callback.data.replace("mass_different_select_package_", ""))
+    
+    # Зберігаємо вибраний пакет
+    await state.update_data(selected_package_id=package_id)
+    
+    # Показуємо підтвердження та запускаємо розсилку
+    await show_different_messages_confirmation(callback, state)
+
+@router.callback_query(lambda c: c.data == "mass_different_select_all_packages")
+async def process_different_messages_select_all_packages(callback: CallbackQuery, state: FSMContext):
+    """Обробка вибору всіх пакетів для розсилки різних повідомлень"""
+    # Зберігаємо вибір всіх пакетів
+    await state.update_data(selected_package_id="all_packages")
+    
+    # Показуємо підтвердження та запускаємо розсилку
+    await show_different_messages_confirmation(callback, state)
+
+async def show_different_messages_confirmation(message_or_callback, state: FSMContext):
+    """Показати підтвердження розсилки різних повідомлень"""
+    data = await state.get_data()
+    selected_package_id = data.get('selected_package_id')
+    account_messages = data.get('account_messages', {})
+    interval = data.get('interval', 60)
+    
+    # Підраховуємо статистику
+    if selected_package_id == "all_packages":
+        total_groups = "всі пакети груп"
+    else:
+        # Отримуємо інформацію про вибраний пакет
+        package_info = db.get_group_package(selected_package_id)
+        total_groups = f"{package_info['groups_count']} груп" if package_info else "невідомо"
+    
+    configured_accounts = list(account_messages.keys())
+    accounts_count = len(configured_accounts)
+    
+    confirmation_text = f"📤 <b>Підтвердження розсилки різних повідомлень:</b>\n\n"
+    confirmation_text += f"👥 <b>Налаштованих аккаунтів:</b> {accounts_count}\n"
+    confirmation_text += f"📱 <b>Аккаунти:</b> {', '.join(configured_accounts)}\n"
+    confirmation_text += f"📦 <b>Груп:</b> {total_groups}\n"
+    confirmation_text += f"⏱️ <b>Інтервал між аккаунтами:</b> {interval} сек\n\n"
+    
+    # Показуємо деталі повідомлень
+    confirmation_text += f"📝 <b>Повідомлення:</b>\n"
+    for phone, msg_data in account_messages.items():
+        if isinstance(msg_data, dict):
+            msg_type = msg_data.get('type', 'text')
+            text = msg_data.get('text', '')
+            if msg_type == 'text':
+                text_preview = text[:50] + "..." if len(text) > 50 else text
+                confirmation_text += f"• {phone}: {text_preview}\n"
+            else:
+                confirmation_text += f"• {phone}: {msg_type} {f'({text[:20]}...)' if text else ''}\n"
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚀 Запустити розсилку", callback_data="start_different_messages_broadcast_final")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="mass_different_messages")]
+    ])
+    
+    if hasattr(message_or_callback, 'message'):
+        await message_or_callback.message.answer(confirmation_text, parse_mode='HTML', reply_markup=keyboard)
+    else:
+        await message_or_callback.answer(confirmation_text, parse_mode='HTML', reply_markup=keyboard)
+
+@router.callback_query(lambda c: c.data == "start_different_messages_broadcast_final")
+async def start_different_messages_broadcast_final_callback(callback: CallbackQuery, state: FSMContext):
+    """Фінальний запуск розсилки різних повідомлень"""
+    data = await state.get_data()
+    account_messages = data.get('account_messages', {})
+    selected_package_id = data.get('selected_package_id')
+    interval = data.get('interval', 60)
+    
+    if not account_messages:
+        await callback.message.answer("❌ Немає налаштованих повідомлень для розсилки.")
+        await callback.answer()
+        return
+    
+    # Отримуємо групи для розсилки
+    if selected_package_id == "all_packages":
+        # Всі пакети
+        selected_groups = []
+        for phone in account_messages.keys():
+            groups = db.get_all_groups_for_account(phone)
+            for group in groups:
+                group['account_phone'] = phone
+                selected_groups.append(group)
+    else:
+        # Конкретний пакет
+        selected_groups = db.get_groups_in_package(selected_package_id)
+    
+    if not selected_groups:
+        await callback.message.answer("❌ Немає груп для розсилки.")
+        await callback.answer()
+        return
+    
+    # Запускаємо розсилку різних повідомлень
+    await start_different_messages_broadcast(callback.message, state, account_messages, selected_groups, interval)
+    await callback.answer()
+
+async def start_different_messages_broadcast(message_obj, state: FSMContext, account_messages: dict, selected_groups: list, interval: int):
+    """Запуск розсилки різних повідомлень"""
+    logger.info(f"🚀 Початок розсилки різних повідомлень")
+    logger.info(f"📊 Параметри розсилки:")
+    logger.info(f"   - Налаштованих аккаунтів: {len(account_messages)}")
+    logger.info(f"   - Груп для розсилки: {len(selected_groups)}")
+    logger.info(f"   - Інтервал між аккаунтами: {interval} сек")
+    
+    try:
+        # Створюємо статус розсилки
+        status_id = None
+        first_account = list(account_messages.keys())[0] if account_messages else None
+        if first_account:
+            status_text = f"Різні повідомлення для {len(account_messages)} аккаунтів"
+            status_id = db.create_broadcast_status(first_account, status_text, len(selected_groups))
+        
+        # Групуємо групи по аккаунтах
+        groups_by_account = {}
+        for group in selected_groups:
+            account_phone = group.get('account_phone')
+            if account_phone and account_phone in account_messages:
+                if account_phone not in groups_by_account:
+                    groups_by_account[account_phone] = []
+                groups_by_account[account_phone].append(group)
+        
+        total_sent = 0
+        total_failed = 0
+        
+        # Відправляємо повідомлення з кожного аккаунта
+        for account_phone, groups in groups_by_account.items():
+            if not groups:
+                continue
+                
+            message_data = account_messages[account_phone]
+            logger.info(f"📱 Відправка з аккаунта {account_phone} до {len(groups)} груп")
+            
+            # Відправляємо повідомлення в групи
+            for group in groups:
+                try:
+                    if message_data['type'] == 'text':
+                        # Текстове повідомлення
+                        await send_text_message(account_phone, group['group_id'], message_data['text'])
+                    else:
+                        # Медіа-повідомлення
+                        await send_media_message(
+                            account_phone, 
+                            group['group_id'], 
+                            message_data['type'], 
+                            message_data.get('file_path'), 
+                            message_data.get('text', ''),
+                            message_data.get('file_id')
+                        )
+                    
+                    total_sent += 1
+                    logger.info(f"✅ Відправлено в групу {group['group_id']} з аккаунта {account_phone}")
+                    
+                    # Затримка між повідомленнями
+                    await asyncio.sleep(10)
+                    
+                except Exception as e:
+                    total_failed += 1
+                    logger.error(f"❌ Помилка відправки в групу {group['group_id']} з аккаунта {account_phone}: {e}")
+            
+            # Затримка між аккаунтами
+            if len(groups_by_account) > 1:  # Якщо є ще аккаунти
+                logger.info(f"⏳ Затримка {interval} сек перед наступним аккаунтом")
+                await asyncio.sleep(interval)
+        
+        # Оновлюємо статус
+        if status_id:
+            db.update_broadcast_status(status_id, total_sent, total_failed, "completed")
+        
+        # Показуємо результат
+        result_text = f"✅ <b>Розсилка різних повідомлень завершена!</b>\n\n"
+        result_text += f"📊 <b>Статистика:</b>\n"
+        result_text += f"• Відправлено: {total_sent}\n"
+        result_text += f"• Невдало: {total_failed}\n"
+        result_text += f"• Аккаунтів використано: {len(groups_by_account)}\n"
+        result_text += f"• Груп оброблено: {len(selected_groups)}"
+        
+        await message_obj.answer(result_text, parse_mode='HTML')
+        
+    except Exception as e:
+        logger.error(f"❌ Помилка в розсилці різних повідомлень: {e}")
+        await message_obj.answer(f"❌ Помилка в розсилці різних повідомлень: {e}")
+        
+        # Оновлюємо статус
+        if status_id:
+            db.update_broadcast_status(status_id, total_sent, total_failed, "failed")
+    
+    # Очищуємо стан
+    await state.clear()
+
+async def send_text_message(account_phone: str, group_id: str, text: str):
+    """Відправити текстове повідомлення"""
+    try:
+        client = db.get_client(account_phone)
+        if not client:
+            raise Exception(f"Клієнт для аккаунта {account_phone} не знайдено")
+        
+        success = await db.send_message_with_retry(
+            client, 
+            str(group_id), 
+            f"Група {group_id}", 
+            text,
+            None
+        )
+        
+        return success
+    except Exception as e:
+        logger.error(f"❌ Помилка відправки текстового повідомлення: {e}")
+        return False
+
+async def send_media_message(account_phone: str, group_id: str, message_type: str, file_path: str = None, caption: str = None, file_id: str = None):
+    """Відправити медіа-повідомлення"""
+    try:
+        client = db.get_client(account_phone)
+        if not client:
+            raise Exception(f"Клієнт для аккаунта {account_phone} не знайдено")
+        
+        # Формуємо повідомлення залежно від типу
+        if message_type == 'photo':
+            if file_path and os.path.exists(file_path):
+                success = await db.send_photo_with_retry(client, str(group_id), file_path, caption)
+            else:
+                raise Exception("Файл фото не знайдено")
+        elif message_type == 'video':
+            if file_path and os.path.exists(file_path):
+                success = await db.send_video_with_retry(client, str(group_id), file_path, caption)
+            else:
+                raise Exception("Файл відео не знайдено")
+        elif message_type == 'audio':
+            if file_path and os.path.exists(file_path):
+                success = await db.send_audio_with_retry(client, str(group_id), file_path, caption)
+            else:
+                raise Exception("Файл аудіо не знайдено")
+        elif message_type == 'document':
+            if file_path and os.path.exists(file_path):
+                success = await db.send_document_with_retry(client, str(group_id), file_path, caption)
+            else:
+                raise Exception("Файл документа не знайдено")
+        elif message_type == 'animation':
+            if file_path and os.path.exists(file_path):
+                success = await db.send_animation_with_retry(client, str(group_id), file_path, caption)
+            else:
+                raise Exception("Файл гіфки не знайдено")
+        elif message_type == 'sticker':
+            if file_id:
+                success = await db.send_sticker_with_retry(client, str(group_id), file_id)
+            else:
+                raise Exception("ID стікера не вказано")
+        elif message_type == 'voice':
+            if file_path and os.path.exists(file_path):
+                success = await db.send_voice_with_retry(client, str(group_id), file_path, caption)
+            else:
+                raise Exception("Файл голосового повідомлення не знайдено")
+        else:
+            raise Exception(f"Невідомий тип медіа: {message_type}")
+        
+        return success
+    except Exception as e:
+        logger.error(f"❌ Помилка відправки медіа-повідомлення: {e}")
+        return False
+
+async def show_different_messages_package_selection(message_or_callback, state: FSMContext):
+    """Показати вибір пакетів для розсилки різних повідомлень"""
+    accounts = db.get_accounts()
+    
+    if not accounts:
+        if hasattr(message_or_callback, 'message'):
+            await message_or_callback.message.answer("❌ Немає зареєстрованих аккаунтів.")
+        else:
+            await message_or_callback.answer("❌ Немає зареєстрованих аккаунтів.")
+        return
+    
+    # Отримуємо всі пакети груп
+    all_packages = []
+    for account in accounts:
+        packages = db.get_group_packages(account['phone_number'])
+        for package in packages:
+            package['account_phone'] = account['phone_number']
+            all_packages.append(package)
+    
+    if not all_packages:
+        if hasattr(message_or_callback, 'message'):
+            await message_or_callback.message.answer("❌ Немає пакетів груп для розсилки.")
+        else:
+            await message_or_callback.answer("❌ Немає пакетів груп для розсилки.")
+        return
+    
+    # Показуємо список пакетів
+    packages_text = "📦 <b>Доступні пакети груп для розсилки різних повідомлень:</b>\n\n"
+    
+    keyboard_buttons = []
+    for i, package in enumerate(all_packages[:10]):  # Показуємо тільки перші 10
+        button_text = f"📦 {package['name']} ({package['groups_count']} груп)"
+        keyboard_buttons.append([InlineKeyboardButton(
+            text=button_text,
+            callback_data=f"mass_different_select_package_{package['id']}"
+        )])
+        packages_text += f"{i+1}. 📦 <b>{package['name']}</b> ({package['groups_count']} груп)\n"
+        packages_text += f"   📱 Аккаунт: {package['account_phone']}\n\n"
+    
+    # Додаємо кнопки для вибору всіх пакетів
+    keyboard_buttons.append([InlineKeyboardButton(
+        text="✅ Вибрати всі пакети",
+        callback_data="mass_different_select_all_packages"
+    )])
+    keyboard_buttons.append([InlineKeyboardButton(
+        text="🔙 Назад",
+        callback_data="mass_different_messages"
+    )])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    
+    if hasattr(message_or_callback, 'message'):
+        await message_or_callback.message.answer(packages_text, parse_mode='HTML', reply_markup=keyboard)
+    else:
+        await message_or_callback.answer(packages_text, parse_mode='HTML', reply_markup=keyboard)
+
 async def show_package_selection(message_or_callback, state: FSMContext):
     """Показати вибір пакетів для розсилки"""
     accounts = db.get_accounts()
@@ -1314,9 +2051,21 @@ async def show_mass_broadcast_confirmation(message_or_callback, state: FSMContex
     if account_messages:
         configured_accounts = list(account_messages.keys())
         accounts_count = len(configured_accounts)
-        confirmation_text = f"📤 <b>Підтвердження масової розсилки:</b>\n\n"
+        confirmation_text = f"📤 <b>Підтвердження розсилки різних повідомлень:</b>\n\n"
         confirmation_text += f"👥 <b>Налаштованих аккаунтів:</b> {accounts_count}\n"
         confirmation_text += f"📱 <b>Аккаунти:</b> {', '.join(configured_accounts)}\n"
+        
+        # Показуємо деталі повідомлень
+        confirmation_text += f"\n📝 <b>Повідомлення:</b>\n"
+        for phone, msg_data in account_messages.items():
+            if isinstance(msg_data, dict):
+                msg_type = msg_data.get('type', 'text')
+                text = msg_data.get('text', '')
+                if msg_type == 'text':
+                    text_preview = text[:50] + "..." if len(text) > 50 else text
+                    confirmation_text += f"• {phone}: {text_preview}\n"
+                else:
+                    confirmation_text += f"• {phone}: {msg_type} {f'({text[:20]}...)' if text else ''}\n"
     else:
         accounts_count = len(set(group['account_phone'] for group in selected_groups if group['account_phone']))
         confirmation_text = f"📤 <b>Підтвердження масової розсилки:</b>\n\n"
@@ -1334,7 +2083,18 @@ async def show_mass_broadcast_confirmation(message_or_callback, state: FSMContex
     elif data.get('cycle_interval'):
         confirmation_text += f"🔄 <b>Інтервал циклу:</b> {data.get('cycle_interval')} сек\n"
     
-    if message_type == 'text':
+    # Перевіряємо чи це шаблон
+    if data.get('template_file_path') or data.get('template_file_id'):
+        # Це шаблон
+        template_info = template_manager.db.get_template(data.get('template_id', 0))
+        if template_info:
+            confirmation_text += f"📋 <b>Шаблон:</b> {template_info['name']}\n"
+            if template_info.get('text'):
+                text_preview = template_info['text'][:100] + "..." if len(template_info['text']) > 100 else template_info['text']
+                confirmation_text += f"📄 <b>Текст:</b> {text_preview}\n"
+            if template_info.get('file_name'):
+                confirmation_text += f"📎 <b>Файл:</b> {template_info['file_name']}\n"
+    elif message_type == 'text':
         confirmation_text += f"📄 <b>Текст:</b> {message_text[:100]}{'...' if len(message_text) > 100 else ''}\n"
     else:
         confirmation_text += f"📎 <b>Файл:</b> {os.path.basename(file_path) if file_path else 'Не вказано'}\n"
@@ -1371,26 +2131,40 @@ async def confirm_mass_broadcast_callback(callback: CallbackQuery, state: FSMCon
         await callback.answer()
         return
     
-    # Підготовка повідомлення
-    if message_type == 'text':
-        message_data = message_text
+    # Перевіряємо чи це різні повідомлення
+    account_messages = data.get('account_messages', {})
+    if account_messages:
+        # Це різні повідомлення - використовуємо їх
+        message_data = account_messages
     else:
-        # Перевіряємо чи є file_path для всіх типів медіа (крім стікерів)
-        if message_type != 'sticker' and not file_path:
-            await callback.message.answer("❌ Помилка: не вказано шлях до файлу.")
-            await callback.answer()
-            return
-        elif message_type == 'sticker' and not data.get('media_file_id'):
-            await callback.message.answer("❌ Помилка: не вказано ID стікера.")
-            await callback.answer()
-            return
-        
-        message_data = {
-            'type': message_type,
-            'text': data.get('text', ''),
-            'file_path': file_path,
-            'file_id': data.get('media_file_id')
-        }
+        # Підготовка повідомлення для загальної розсилки
+        if message_type == 'text':
+            message_data = message_text
+        elif data.get('template_file_path') or data.get('template_file_id'):
+            # Це шаблон
+            message_data = {
+                'type': message_type,
+                'text': data.get('message_text', ''),
+                'file_path': data.get('template_file_path'),
+                'file_id': data.get('template_file_id')
+            }
+        else:
+            # Перевіряємо чи є file_path для всіх типів медіа (крім стікерів)
+            if message_type != 'sticker' and not file_path:
+                await callback.message.answer("❌ Помилка: не вказано шлях до файлу.")
+                await callback.answer()
+                return
+            elif message_type == 'sticker' and not data.get('media_file_id'):
+                await callback.message.answer("❌ Помилка: не вказано ID стікера.")
+                await callback.answer()
+                return
+            
+            message_data = {
+                'type': message_type,
+                'text': data.get('text', ''),
+                'file_path': file_path,
+                'file_id': data.get('media_file_id')
+            }
     
     # Очищуємо флаг зупинки перед запуском
     await state.update_data(stop_broadcast=False)
@@ -1459,9 +2233,25 @@ async def confirm_loop_broadcast_callback(callback: CallbackQuery, state: FSMCon
         await callback.answer()
         return
     
+    # Перевіряємо чи є account_messages (різні повідомлення для аккаунтів)
+    account_messages = data.get('account_messages', {})
+    print(f"DEBUG: confirm_loop_broadcast_callback - account_messages: {account_messages}")
+    
     # Підготовка повідомлення
-    if message_type == 'text':
+    if account_messages:
+        # Використовуємо account_messages напряму
+        message_data = account_messages
+        print(f"DEBUG: Використовуємо account_messages для циклічної розсилки")
+    elif message_type == 'text':
         message_data = message_text
+    elif data.get('template_file_path') or data.get('template_file_id'):
+        # Це шаблон
+        message_data = {
+            'type': message_type,
+            'text': data.get('message_text', ''),
+            'file_path': data.get('template_file_path'),
+            'file_id': data.get('template_file_id')
+        }
     else:
         # Перевіряємо чи є file_path для всіх типів медіа (крім стікерів)
         if message_type != 'sticker' and not file_path:
@@ -1628,11 +2418,8 @@ async def mass_broadcast_process(message_text, interval: int, use_random: bool,
         else:
             total_groups = 0
         
-        # Створюємо статус для першого аккаунта (якщо є)
-        accounts = db.get_accounts()
-        if accounts:
-            first_account = accounts[0]['phone_number']
-            status_id = db.create_broadcast_status(first_account, status_text, total_groups)
+        # Не створюємо загальний статус - статуси будуть створені для кожного аккаунта окремо
+        status_id = None
             
     except Exception as e:
         logger.error(f"❌ Помилка при створенні статусу розсилки: {e}")
@@ -1744,6 +2531,9 @@ async def mass_broadcast_process(message_text, interval: int, use_random: bool,
                 logger.info(f"🔌 Підключаємося до Telegram для аккаунта {account_phone}")
                 await client.connect()
                 
+                # Реєструємо активний клієнт
+                register_active_client(account_phone, client)
+                
                 if not await client.is_user_authorized():
                     logger.error(f"❌ Аккаунт {account_phone} не авторизований")
                     await client.disconnect()
@@ -1751,13 +2541,35 @@ async def mass_broadcast_process(message_text, interval: int, use_random: bool,
                 
                 logger.info(f"✅ Аккаунт {account_phone} успішно авторизований")
                 
+                # Встановлюємо статус running тільки для поточного аккаунта
+                try:
+                    total_groups_for_account = len(groups)
+                    message_preview = "Масова розсилка"
+                    if account_messages and account_phone in account_messages:
+                        msg_data = account_messages[account_phone]
+                        if isinstance(msg_data, dict):
+                            msg_type = msg_data.get('type', 'text')
+                            message_preview = f"Масова розсилка ({msg_type})"
+                    elif isinstance(message_text, str):
+                        message_preview = message_text[:50] + "..." if len(message_text) > 50 else message_text
+                    
+                    # Встановлюємо статус running тільки для цього аккаунта
+                    db.set_broadcast_status(account_phone, message_preview, total_groups_for_account, 0, 0, 'running')
+                    logger.info(f"✅ Встановлено статус running для аккаунта {account_phone}")
+                except Exception as e:
+                    logger.error(f"❌ Помилка при встановленні статусу running для {account_phone}: {e}")
+                
                 # Визначаємо повідомлення для цього аккаунта
                 if account_messages and account_phone in account_messages:
                     logger.info(f"📝 Використовуємо налаштоване повідомлення для аккаунта {account_phone}")
                     current_message = account_messages[account_phone]
                 else:
-                    # Для загальної розсилки - перевіряємо чи це медіа
-                    if message_type and media_file_path:
+                    # Для загальної розсилки - перевіряємо чи це шаблон
+                    if isinstance(message_text, dict) and message_text.get('type'):
+                        # Це шаблон
+                        logger.info(f"📋 Використовуємо шаблон: {message_text['type']}")
+                        current_message = message_text
+                    elif message_type and media_file_path:
                         # Це медіа-повідомлення
                         logger.info(f"📎 Використовуємо медіа-повідомлення: {message_type}, файл: {media_file_path}")
                         current_message = {
@@ -1919,6 +2731,22 @@ async def mass_broadcast_process(message_text, interval: int, use_random: bool,
                 
                 logger.info(f"🔌 Відключаємо клієнт для аккаунта {account_phone}")
                 await client.disconnect()
+                unregister_active_client(account_phone)
+                
+                # Оновлюємо статус на completed після завершення роботи аккаунта
+                try:
+                    # Підраховуємо успішні та невдалі відправки для цього аккаунта
+                    account_sent = 0
+                    account_failed = 0
+                    for group in groups:
+                        # Тут можна додати більш точний підрахунок, але поки використовуємо загальні дані
+                        pass
+                    
+                    # Оновлюємо статус на completed
+                    db.update_broadcast_status_by_phone(account_phone, account_sent, account_failed, 'completed')
+                    logger.info(f"✅ Оновлено статус completed для аккаунта {account_phone}")
+                except Exception as e:
+                    logger.error(f"❌ Помилка при оновленні статусу для {account_phone}: {e}")
                 
                 # Затримка між аккаунтами
                 # Перевіряємо флаг зупинки перед затримкою між аккаунтами
@@ -1949,6 +2777,14 @@ async def mass_broadcast_process(message_text, interval: int, use_random: bool,
             except Exception as e:
                 logger.error(f"❌ Помилка при обробці аккаунта {account_phone}: {e}")
                 logger.info(f"📊 Статистика після помилки аккаунта: відправлено={total_sent}, невдало={total_failed}")
+                
+                # Оновлюємо статус на failed при помилці
+                try:
+                    db.update_broadcast_status_by_phone(account_phone, 0, len(groups), 'failed')
+                    logger.info(f"✅ Оновлено статус failed для аккаунта {account_phone}")
+                except Exception as status_error:
+                    logger.error(f"❌ Помилка при оновленні статусу failed для {account_phone}: {status_error}")
+                
                 continue
         
         # Підраховуємо загальну кількість груп
@@ -2014,6 +2850,10 @@ async def loop_broadcast_process(message_text, interval: int, use_random: bool,
     logger.info("🚀 Початок циклічної розсилки")
     logger.info(f"📊 Параметри розсилки: interval={interval}, use_random={use_random}, package_id={selected_package_id}")
     logger.info(f"📱 Тип повідомлення: {message_type}, media_file_path={media_file_path}")
+    print(f"DEBUG: loop_broadcast_process - account_messages: {account_messages}")
+    print(f"DEBUG: loop_broadcast_process - message_text: {message_text}")
+    print(f"DEBUG: loop_broadcast_process - message_type: {message_type}")
+    print(f"DEBUG: loop_broadcast_process - media_file_path: {media_file_path}")
     
     await message_obj.answer("🔄 Циклічна розсилка запущена. Для зупинки використайте команду /stop_message")
     
@@ -2133,6 +2973,9 @@ async def loop_broadcast_process(message_text, interval: int, use_random: bool,
                                    f"📦 <b>Груп:</b> {len(groups_to_send)}",
                                    parse_mode='HTML')
             
+            # НЕ встановлюємо статус для всіх аккаунтів на початку циклу
+            # Статус буде встановлений тільки для поточного аккаунта перед його обробкою
+            
             # Проходимо по всіх аккаунтах
             for account_phone, groups in groups_by_account.items():
                 # Перевіряємо флаг зупинки перед обробкою кожного аккаунта
@@ -2168,6 +3011,9 @@ async def loop_broadcast_process(message_text, interval: int, use_random: bool,
                     logger.info(f"🔌 Підключаємося до Telegram для аккаунта {account_phone}")
                     await client.connect()
                     
+                    # Реєструємо активний клієнт
+                    register_active_client(account_phone, client)
+                    
                     if not await client.is_user_authorized():
                         logger.error(f"❌ Аккаунт {account_phone} не авторизований")
                         await client.disconnect()
@@ -2175,10 +3021,45 @@ async def loop_broadcast_process(message_text, interval: int, use_random: bool,
                     
                     logger.info(f"✅ Аккаунт {account_phone} успішно авторизований")
                     
+                    # Встановлюємо статус running для аккаунта
+                    try:
+                        # Отримуємо загальну кількість груп для цього аккаунта
+                        total_groups = len(groups)
+                        message_preview = "Циклічна розсилка"
+                        if account_messages and account_phone in account_messages:
+                            msg_data = account_messages[account_phone]
+                            if isinstance(msg_data, dict):
+                                msg_type = msg_data.get('type', 'text')
+                                message_preview = f"Циклічна розсилка ({msg_type})"
+                        
+                        # Встановлюємо статус running
+                        db.set_broadcast_status(account_phone, message_preview, total_groups, 0, 0, 'running')
+                        logger.info(f"✅ Встановлено статус running для аккаунта {account_phone}")
+                    except Exception as e:
+                        logger.error(f"❌ Помилка при встановленні статусу running для {account_phone}: {e}")
+                    
                     # Визначаємо повідомлення для цього аккаунта
                     if account_messages and account_phone in account_messages:
                         logger.info(f"📝 Використовуємо налаштоване повідомлення для аккаунта {account_phone}")
                         current_message = account_messages[account_phone]
+                        logger.info(f"DEBUG: current_message для {account_phone}: {current_message}")
+                        
+                        # Перевіряємо чи є file_path для медіа-повідомлень
+                        if isinstance(current_message, dict) and current_message.get('type') in ['photo', 'video', 'audio', 'document', 'sticker', 'voice', 'animation']:
+                            file_path = current_message.get('file_path')
+                            file_id = current_message.get('file_id')
+                            logger.info(f"DEBUG: Медіа-повідомлення для {account_phone}: file_path={file_path}, file_id={file_id}")
+                            
+                            if not file_path and not file_id:
+                                logger.error(f"❌ Помилка: не вказано шлях до файлу для медіа-повідомлення аккаунта {account_phone}")
+                                await message_obj.answer(f"❌ Помилка: не вказано шлях до файлу для медіа-повідомлення аккаунта {account_phone}")
+                                await client.disconnect()
+                                continue
+                            elif file_path and not os.path.exists(file_path):
+                                logger.error(f"❌ Помилка: файл {file_path} не існує для аккаунта {account_phone}")
+                                await message_obj.answer(f"❌ Помилка: файл {file_path} не існує для аккаунта {account_phone}")
+                                await client.disconnect()
+                                continue
                     else:
                         # Для загальної розсилки - перевіряємо чи це медіа
                         if message_type and media_file_path:
@@ -2316,6 +3197,7 @@ async def loop_broadcast_process(message_text, interval: int, use_random: bool,
                         
                     logger.info(f"🔌 Відключаємо клієнт для аккаунта {account_phone}")
                     await client.disconnect()
+                    unregister_active_client(account_phone)
                     
                     # Затримка між аккаунтами (тільки якщо не останній аккаунт)
                     if account_phone != list(groups_by_account.keys())[-1]:
@@ -2346,10 +3228,34 @@ async def loop_broadcast_process(message_text, interval: int, use_random: bool,
                                                parse_mode='HTML')
                         await asyncio.sleep(delay)
                     
+                    # Оновлюємо статус після завершення обробки аккаунта
+                    try:
+                        # Підраховуємо статистику для цього аккаунта
+                        account_sent = 0
+                        account_failed = 0
+                        for group in groups:
+                            # Тут можна додати логіку підрахунку статистики для конкретного аккаунта
+                            # Поки що використовуємо загальну статистику
+                            pass
+                        
+                        # Оновлюємо статус на completed
+                        db.update_broadcast_status_by_phone(account_phone, total_sent, total_failed, 'completed')
+                        logger.info(f"✅ Оновлено статус completed для аккаунта {account_phone}")
+                    except Exception as e:
+                        logger.error(f"❌ Помилка при оновленні статусу для {account_phone}: {e}")
+                    
                     logger.info(f"✅ Завершено обробку аккаунта {account_phone}")
                 except Exception as e:
                     logger.error(f"❌ Помилка при обробці аккаунта {account_phone}: {e}")
                     logger.info(f"📊 Статистика після помилки аккаунта: відправлено={total_sent}, невдало={total_failed}")
+                    
+                    # Оновлюємо статус на failed при помилці
+                    try:
+                        db.update_broadcast_status_by_phone(account_phone, 0, len(groups), 'failed')
+                        logger.info(f"✅ Оновлено статус failed для аккаунта {account_phone}")
+                    except Exception as status_error:
+                        logger.error(f"❌ Помилка при оновленні статусу failed для {account_phone}: {status_error}")
+                    
                     continue
             
             # Затримка між циклами (рандомна від 10 до 120 секунд)
@@ -2421,14 +3327,150 @@ async def loop_broadcast_process(message_text, interval: int, use_random: bool,
 @router.message(Command("stop_message"))
 async def stop_message_command(message: Message, state: FSMContext):
     """Команда зупинки масової розсилки"""
-    # Встановлюємо флаг зупинки в FSM state
-    await state.update_data(stop_broadcast=True)
-    await message.answer("🛑 <b>Команда зупинки розсилки отримана!</b>\n\n"
-                        "⏳ Активні розсилки будуть зупинені:\n"
-                        "• Після завершення поточного повідомлення\n"
-                        "• Перед наступною затримкою\n"
-                        "• Перед обробкою наступного аккаунта\n"
-                        "• Перед наступним циклом (для циклічної розсилки)\n\n"
-                        "📊 Статус зупинки буде показано в наступних повідомленнях.",
-                        parse_mode='HTML')
+    await handle_stop_message_command(message, state)
+
+#====================== ОБРОБКА ШАБЛОНІВ ======================
+
+@router.callback_query(lambda c: c.data.startswith("select_template_"))
+async def select_template_callback(callback: CallbackQuery, state: FSMContext):
+    """Обробка вибору шаблону"""
+    print(f"DEBUG: select_template_callback called with data: {callback.data}")
+    template_id = int(callback.data.replace("select_template_", ""))
+    print(f"DEBUG: Extracted template_id: {template_id}")
+    template = template_manager.get_template_for_broadcast(template_id)
+    print(f"DEBUG: Retrieved template: {template}")
+    
+    if not template:
+        await callback.message.answer("❌ Шаблон не знайдено")
+        await callback.answer()
+        return
+    
+    # Перевіряємо чи це для конкретного аккаунта (різні повідомлення)
+    data = await state.get_data()
+    selected_account = data.get('selected_account_for_message')
+    
+    print(f"DEBUG: select_template_callback - selected_account: {selected_account}")
+    print(f"DEBUG: select_template_callback - template_id: {template_id}")
+    
+    if selected_account:
+        # Це для конкретного аккаунта - зберігаємо повідомлення для цього аккаунта
+        print(f"DEBUG: Зберігаємо шаблон для аккаунта {selected_account}")
+        print(f"DEBUG: template data: {template}")
+        print(f"DEBUG: file_path: {template.get('file_path')}")
+        print(f"DEBUG: file_id: {template.get('file_id')}")
+        await save_account_message(state, selected_account, template['type'], template.get('file_path'), template.get('text', ''), template.get('file_id'))
+        
+        # Видаляємо поточний аккаунт зі списку
+        accounts_to_configure = data.get('accounts_to_configure', [])
+        accounts_to_configure = [acc for acc in accounts_to_configure if acc['phone_number'] != selected_account]
+        await state.update_data(accounts_to_configure=accounts_to_configure)
+        
+        await callback.message.answer(f"✅ Шаблон для аккаунта {selected_account} збережено!")
+        
+        # Показуємо наступний аккаунт або переходимо до налаштування інтервалів
+        await show_remaining_accounts(callback.message, state)
+    else:
+        # Це для загальної розсилки - зберігаємо дані шаблону
+        await state.update_data(
+            message_type=template['type'],
+            message_text=template.get('text', ''),
+            template_file_path=template.get('file_path'),
+            template_file_id=template.get('file_id'),
+            template_id=template_id
+        )
+        
+        # Показуємо підтвердження
+        template_info = template_manager.db.get_template(template_id)
+        icon = template_manager._get_template_icon(template['type'])
+        
+        confirmation_text = f"✅ <b>Шаблон обрано:</b>\n\n"
+        confirmation_text += f"{icon} <b>Назва:</b> {template_info['name']}\n"
+        confirmation_text += f"📝 <b>Тип:</b> {template['type']}\n"
+        
+        if template.get('text'):
+            text_preview = template['text'][:100] + "..." if len(template['text']) > 100 else template['text']
+            confirmation_text += f"💬 <b>Текст:</b> {text_preview}\n"
+        
+        if template.get('file_path'):
+            confirmation_text += f"📎 <b>Файл:</b> {template_info['file_name']}\n"
+        
+        confirmation_text += "\n🚀 Продовжити з цим шаблоном?"
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Продовжити", callback_data="confirm_template_selection")],
+            [InlineKeyboardButton(text="❌ Скасувати", callback_data="Mass_broadcast")]
+        ])
+        
+        await callback.message.answer(confirmation_text, parse_mode='HTML', reply_markup=keyboard)
+    
+    await callback.answer()
+
+@router.callback_query(lambda c: c.data == "confirm_template_selection")
+async def confirm_template_selection_callback(callback: CallbackQuery, state: FSMContext):
+    """Підтвердження вибору шаблону"""
+    data = await state.get_data()
+    message_type = data.get('message_type')
+    
+    # Перевіряємо чи це шаблон
+    if data.get('template_file_path') or data.get('template_file_id'):
+        # Це шаблон - переходимо до налаштування інтервалів
+        await show_message_interval_settings(callback, state)
+    elif message_type == 'text':
+        # Для текстового повідомлення переходимо до налаштування інтервалів
+        await show_message_interval_settings(callback, state)
+    else:
+        # Для медіа повідомлення також переходимо до налаштування інтервалів
+        await show_message_interval_settings(callback, state)
+    
+    await callback.answer()
+
+@router.callback_query(lambda c: c.data == "add_template")
+async def add_template_callback(callback: CallbackQuery, state: FSMContext):
+    """Додавання нового шаблону"""
+    await callback.message.answer(
+        "📋 <b>Створення нового шаблону</b>\n\n"
+        "Відправте повідомлення (текст, фото, відео, аудіо тощо), яке ви хочете зберегти як шаблон.\n\n"
+        "Після відправки введіть назву для шаблону.",
+        parse_mode='HTML'
+    )
+    await state.set_state(MassBroadcastStates.waiting_for_template_message)
+    await callback.answer()
+
+@router.callback_query(lambda c: c.data == "edit_templates")
+async def edit_templates_callback(callback: CallbackQuery, state: FSMContext):
+    """Редагування шаблонів"""
+    templates = template_manager.db.get_templates()
+    if templates:
+        keyboard = template_manager.get_templates_list_keyboard()
+        await callback.message.answer(
+            "✏️ <b>Оберіть шаблон для редагування:</b>",
+            parse_mode='HTML',
+            reply_markup=keyboard
+        )
+    else:
+        await callback.message.answer(
+            "❌ <b>Шаблони не знайдені</b>\n\n"
+            "Спочатку створіть шаблон, відправивши повідомлення боту з командою /add_template",
+            parse_mode='HTML'
+        )
+    await callback.answer()
+
+@router.callback_query(lambda c: c.data == "close_templates")
+async def close_templates_callback(callback: CallbackQuery, state: FSMContext):
+    """Закриття меню шаблонів"""
+    await callback.message.answer("❌ Меню шаблонів закрито")
+    await callback.answer()
+
+@router.callback_query(lambda c: c.data == "back_to_templates")
+async def back_to_templates_callback(callback: CallbackQuery, state: FSMContext):
+    """Повернення до списку шаблонів"""
+    templates = template_manager.db.get_templates()
+    if templates:
+        keyboard = template_manager.get_template_keyboard(templates)
+        await callback.message.answer(
+            "📋 <b>Оберіть шаблон:</b>",
+            parse_mode='HTML',
+            reply_markup=keyboard
+        )
+    await callback.answer()
 
