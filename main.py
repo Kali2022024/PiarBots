@@ -60,7 +60,7 @@ init_join_groups_module(db)
 import database
 RANDOM_STICKERS = database.RANDOM_STICKERS
 
-@router.message(Command("start"))
+@router.message(Command("start_bot"))
 async def cmd_start(message: Message):
     """Обробник команди /start"""
     welcome_text = f"""
@@ -360,7 +360,26 @@ async def confirm_delete_template_callback(callback: CallbackQuery):
 @router.callback_query(lambda c: c.data == "close_templates")
 async def close_templates_callback(callback: CallbackQuery):
     """Закриття меню шаблонів"""
-    await callback.message.answer("❌ Меню шаблонів закрито")
+    await callback.message.edit_text(
+        "🎯 <b>Головне меню</b>\n\n"
+        "📱 <b>Доступні команди:</b>\n"
+        "• <code>/start</code> - головне меню\n"
+        "• <code>/stop_message</code> - зупинити всі розсилки\n"
+        "• <code>/stop_message +380123456789</code> - зупинити розсилку конкретного аккаунта\n\n"
+        "🔧 <b>Доступні функції:</b>\n"
+        "• Реєстрація аккаунтів\n"
+        "• Масові розсилки\n"
+        "• Управління шаблонами\n"
+        "• Статистика розсилок",
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📱 Аккаунти", callback_data="accounts")],
+            [InlineKeyboardButton(text="📢 Масові розсилки", callback_data="Mass_broadcast")],
+            [InlineKeyboardButton(text="📝 Шаблони", callback_data="templates_menu")],
+            [InlineKeyboardButton(text="🛑 Зупинити всі розсилки", callback_data="stop_all_broadcasts")],
+            [InlineKeyboardButton(text="🛑 Зупинити розсилку аккаунта", callback_data="stop_account_broadcast")]
+        ])
+    )
     await callback.answer()
 
 async def main():

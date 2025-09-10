@@ -3383,7 +3383,7 @@ async def select_template_callback(callback: CallbackQuery, state: FSMContext):
         template_info = template_manager.db.get_template(template_id)
         icon = template_manager._get_template_icon(template['type'])
         
-        confirmation_text = f"✅ <b>Шаблон обрано:</b>\n\n"
+        confirmation_text = f"✅ <b>Шаблон:</b>\n\n"
         confirmation_text += f"{icon} <b>Назва:</b> {template_info['name']}\n"
         confirmation_text += f"📝 <b>Тип:</b> {template['type']}\n"
         
@@ -3393,34 +3393,12 @@ async def select_template_callback(callback: CallbackQuery, state: FSMContext):
         
         if template.get('file_path'):
             confirmation_text += f"📎 <b>Файл:</b> {template_info['file_name']}\n"
-        
-        confirmation_text += "\n🚀 Продовжити з цим шаблоном?"
-        
+
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Продовжити", callback_data="confirm_template_selection")],
-            [InlineKeyboardButton(text="❌ Скасувати", callback_data="Mass_broadcast")]
+            [InlineKeyboardButton(text="👈🏼Назад", callback_data="back_to_templates")],
         ])
         
         await callback.message.answer(confirmation_text, parse_mode='HTML', reply_markup=keyboard)
-    
-    await callback.answer()
-
-@router.callback_query(lambda c: c.data == "confirm_template_selection")
-async def confirm_template_selection_callback(callback: CallbackQuery, state: FSMContext):
-    """Підтвердження вибору шаблону"""
-    data = await state.get_data()
-    message_type = data.get('message_type')
-    
-    # Перевіряємо чи це шаблон
-    if data.get('template_file_path') or data.get('template_file_id'):
-        # Це шаблон - переходимо до налаштування інтервалів
-        await show_message_interval_settings(callback, state)
-    elif message_type == 'text':
-        # Для текстового повідомлення переходимо до налаштування інтервалів
-        await show_message_interval_settings(callback, state)
-    else:
-        # Для медіа повідомлення також переходимо до налаштування інтервалів
-        await show_message_interval_settings(callback, state)
     
     await callback.answer()
 
@@ -3458,7 +3436,7 @@ async def edit_templates_callback(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(lambda c: c.data == "close_templates")
 async def close_templates_callback(callback: CallbackQuery, state: FSMContext):
     """Закриття меню шаблонів"""
-    await callback.message.answer("❌ Меню шаблонів закрито")
+    await callback('Mass_broadcast')
     await callback.answer()
 
 @router.callback_query(lambda c: c.data == "back_to_templates")
@@ -3473,4 +3451,3 @@ async def back_to_templates_callback(callback: CallbackQuery, state: FSMContext)
             reply_markup=keyboard
         )
     await callback.answer()
-

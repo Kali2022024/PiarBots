@@ -6,7 +6,6 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from database import Database
-
 logger = logging.getLogger(__name__)
 
 class TemplateStates(StatesGroup):
