@@ -76,7 +76,6 @@ async def cmd_start(message: Message):
 /accounts - Список аккаунтів
 /delete_account - видалити аккаунт
 /stop_message - зупинити всі розсилки
-/stop_message +380123456789 - зупинити розсилку аккаунта
     """
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 Список аккаунтів", callback_data="accounts")],
@@ -364,8 +363,7 @@ async def close_templates_callback(callback: CallbackQuery):
         "🎯 <b>Головне меню</b>\n\n"
         "📱 <b>Доступні команди:</b>\n"
         "• <code>/start</code> - головне меню\n"
-        "• <code>/stop_message</code> - зупинити всі розсилки\n"
-        "• <code>/stop_message +380123456789</code> - зупинити розсилку конкретного аккаунта\n\n"
+        "• <code>/stop_message</code> - зупинити всі розсилки\n\n"
         "🔧 <b>Доступні функції:</b>\n"
         "• Реєстрація аккаунтів\n"
         "• Масові розсилки\n"
@@ -394,9 +392,45 @@ async def main():
         
         logger.info("🔄 Запуск бота...")
         await dp.start_polling(bot)
+    except KeyboardInterrupt:
+        logger.info("🛑 Отримано сигнал завершення...")
+        
+        # Імпортуємо функції очищення
+        try:
+            from mass_broadcast import disconnect_all_active_clients, cleanup_hanging_tasks
+            logger.info("🧹 Очищення ресурсів...")
+            
+            # Відключаємо всі клієнти
+            await disconnect_all_active_clients()
+            
+            # Очищаємо завислі задачі
+            await cleanup_hanging_tasks()
+            
+            logger.info("✅ Очищення завершено")
+        except Exception as cleanup_error:
+            logger.warning(f"⚠️ Помилка при очищенні: {cleanup_error}")
+        
+        logger.info("👋 Бот зупинений")
     except Exception as e:
         logger.error(f"❌ Помилка при запуску бота: {e}")
+        
+        # Навіть при помилці намагаємося очистити ресурси
+        try:
+            from mass_broadcast import disconnect_all_active_clients, cleanup_hanging_tasks
+            await disconnect_all_active_clients()
+            await cleanup_hanging_tasks()
+        except:
+            pass
+        
         raise
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("🛑 Програма зупинена користувачем")
+    except Exception as e:
+        print(f"❌ Критична помилка: {e}")
+        logger.error(f"❌ Критична помилка: {e}")
+    finally:
+        print("👋 Завершення роботи програми")

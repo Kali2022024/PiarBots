@@ -20,180 +20,141 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 async def handle_stop_message_command(message: Message, state: FSMContext):
-    """Універсальна обробка команди /stop_message"""
-    # Парсимо команду
-    command_parts = message.text.strip().split()
+    """Обробка команди /stop_message - зупинка всіх розсилок"""
+    # Зупиняємо всі розсилки
+    await state.update_data(stop_broadcast=True)
     
-    if len(command_parts) == 1:
-        # Зупиняємо всі розсилки
-        await state.update_data(stop_broadcast=True)
-        
-        try:
-            with sqlite3.connect(db.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    UPDATE broadcast_status 
-                    SET status = 'completed', finished_at = CURRENT_TIMESTAMP
-                    WHERE status IN ('pending', 'running')
-                """)
-                updated_count = cursor.rowcount
-                conn.commit()
-                
-            if updated_count > 0:
-                await message.answer(f"🛑 <b>Команда зупинки всіх розсилок отримана!</b>\n\n"
-                                   f"✅ Зупинено {updated_count} активних розсилок\n"
-                                   f"🔄 Циклічні розсилки будуть зупинені після завершення поточного циклу\n\n"
-                                   f"📊 Всі аккаунти тепер доступні для нових розсилок.",
-                                   parse_mode='HTML')
-            else:
-                await message.answer("🛑 <b>Команда зупинки всіх розсилок отримана!</b>\n\n"
-                                   "ℹ️ Активних розсилок не знайдено\n"
-                                   "🔄 Циклічні розсилки будуть зупинені після завершення поточного циклу",
-                                   parse_mode='HTML')
-        except Exception as e:
-            logger.error(f"❌ Помилка при зупинці всіх розсилок: {e}")
-            await message.answer("🛑 <b>Команда зупинки всіх розсилок отримана!</b>\n\n"
-                               "⚠️ Помилка при очищенні статусів, але флаг зупинки встановлено",
-                               parse_mode='HTML')
-    
-    elif len(command_parts) == 2:
-        # Зупиняємо розсилку конкретного аккаунта
-        phone_number = command_parts[1]
-        
-        # Перевіряємо чи аккаунт існує
-        accounts = db.get_accounts()
-        account_exists = any(acc['phone_number'] == phone_number for acc in accounts)
-        
-        if not account_exists:
-            await message.answer(f"❌ <b>Аккаунт не знайдено!</b>\n\n"
-                               f"📱 Номер: {phone_number}\n"
-                               f"ℹ️ Перевірте правильність номера телефону",
-                               parse_mode='HTML')
-            return True
-        
-        try:
-            with sqlite3.connect(db.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    UPDATE broadcast_status 
-                    SET status = 'completed', finished_at = CURRENT_TIMESTAMP
-                    WHERE account_phone = ? AND status IN ('pending', 'running')
-                """, (phone_number,))
-                updated_count = cursor.rowcount
-                conn.commit()
+    try:
+        with sqlite3.connect(db.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE broadcast_status 
+                SET status = 'completed', finished_at = CURRENT_TIMESTAMP
+                WHERE status IN ('pending', 'running')
+            """)
+            updated_count = cursor.rowcount
+            conn.commit()
             
-            # Відключаємо клієнт Telegram для цього аккаунта
-            disconnect_success = await disconnect_account_client(phone_number)
-                
-            if updated_count > 0:
-                disconnect_info = "🔌 Клієнт відключений" if disconnect_success else "⚠️ Клієнт не відключений"
-                await message.answer(f"🛑 <b>Команда зупинки розсилки аккаунта отримана!</b>\n\n"
-                                   f"📱 <b>Аккаунт:</b> {phone_number}\n"
-                                   f"✅ Зупинено {updated_count} активних розсилок\n"
-                                   f"{disconnect_info}\n\n"
-                                   f"📊 Аккаунт тепер доступний для нових розсилок.",
-                                   parse_mode='HTML')
-            else:
-                disconnect_info = "🔌 Клієнт відключений" if disconnect_success else "⚠️ Клієнт не відключений"
-                await message.answer(f"🛑 <b>Команда зупинки розсилки аккаунта отримана!</b>\n\n"
-                                   f"📱 <b>Аккаунт:</b> {phone_number}\n"
-                                   f"ℹ️ Активних розсилок для цього аккаунта не знайдено\n"
-                                   f"{disconnect_info}",
-                                   parse_mode='HTML')
-        except Exception as e:
-            logger.error(f"❌ Помилка при зупинці розсилки аккаунта {phone_number}: {e}")
-            await message.answer(f"🛑 <b>Команда зупинки розсилки аккаунта отримана!</b>\n\n"
-                               f"📱 <b>Аккаунт:</b> {phone_number}\n"
-                               f"⚠️ Помилка при очищенні статусів",
+        if updated_count > 0:
+            await message.answer(f"🛑 <b>Команда зупинки всіх розсилок отримана!</b>\n\n"
+                               f"✅ Зупинено {updated_count} активних розсилок\n"
+                               f"🔄 Циклічні розсилки будуть зупинені після завершення поточного циклу\n\n"
+                               f"📊 Всі аккаунти тепер доступні для нових розсилок.",
                                parse_mode='HTML')
-    
-    else:
-        # Невірний формат команди
-        await message.answer("❌ <b>Невірний формат команди!</b>\n\n"
-                           "📝 <b>Правильні формати:</b>\n"
-                           "• <code>/stop_message</code> - зупинити всі розсилки\n"
-                           "• <code>/stop_message +380123456789</code> - зупинити розсилку конкретного аккаунта",
+        else:
+            await message.answer("🛑 <b>Команда зупинки всіх розсилок отримана!</b>\n\n"
+                               "ℹ️ Активних розсилок не знайдено\n"
+                               "🔄 Циклічні розсилки будуть зупинені після завершення поточного циклу",
+                               parse_mode='HTML')
+    except Exception as e:
+        logger.error(f"❌ Помилка при зупинці всіх розсилок: {e}")
+        await message.answer("🛑 <b>Команда зупинки всіх розсилок отримана!</b>\n\n"
+                           "⚠️ Помилка при очищенні статусів, але флаг зупинки встановлено",
                            parse_mode='HTML')
+    
+    # Очищаємо завислі задачі після зупинки
+    try:
+        logger.info("🧹 Починаємо очищення завислих задач після зупинки...")
+        
+        # Спочатку відключаємо всі активні клієнти
+        await disconnect_all_active_clients()
+        
+        # Потім очищаємо завислі задачі
+        await cleanup_hanging_tasks()
+        
+        # Форсоване очищення всіх сесій
+        await force_cleanup_all_sessions()
+        
+        # Додаткова пауза для завершення всіх процесів
+        await asyncio.sleep(0.5)
+        
+        logger.info("✅ Очищення завершено")
+        
+    except Exception as cleanup_error:
+        logger.warning(f"⚠️ Помилка при очищенні завислих задач: {cleanup_error}")
     
     return True
 
 async def disconnect_account_client(account_phone: str) -> bool:
     """Відключити клієнт Telegram для конкретного аккаунта"""
+    logger.info(f"🔌 Починаємо безпечне відключення клієнта для аккаунта {account_phone}")
+    
     try:
         # Спочатку перевіряємо реєстр активних клієнтів
         global active_clients
-        if account_phone in active_clients:
-            client = active_clients[account_phone]
-            if client.is_connected():
-                logger.info(f"🔌 Знайдено активний клієнт в реєстрі для аккаунта {account_phone}, відключаємо...")
-                await client.disconnect()
-                unregister_active_client(account_phone)
-                logger.info(f"✅ Активний клієнт з реєстру для аккаунта {account_phone} відключений")
-        
-        # Також перевіряємо чи є клієнт через database.py
-        existing_client = db.get_client(account_phone) if hasattr(db, 'get_client') else None
-        
-        if existing_client and existing_client.is_connected():
-            logger.info(f"🔌 Знайдено активний клієнт через DB для аккаунта {account_phone}, відключаємо...")
-            await existing_client.disconnect()
-            logger.info(f"✅ Активний клієнт через DB для аккаунта {account_phone} відключений")
-        
-        # Створюємо всі можливі імена сесій для аккаунта
-        phone_clean = account_phone.replace('+', '').replace('-', '')
-        session_names = [
-            f"sessions/temp_{phone_clean}",
-            f"session_{phone_clean}",
-            f"session_{account_phone}",
-            f"session.session"  # загальна сесія
-        ]
-        
-        # Отримуємо дані аккаунта
-        accounts = db.get_accounts()
-        account = None
-        for acc in accounts:
-            if acc['phone_number'] == account_phone:
-                account = acc
-                break
-        
-        if not account:
-            logger.warning(f"⚠️ Аккаунт {account_phone} не знайдено для відключення")
-            return False
-        
         disconnected_any = False
         
-        # Пробуємо відключити всі можливі сесії
-        for session_name in session_names:
-            try:
-                logger.info(f"🔍 Перевіряємо сесію: {session_name}")
-                
-                # Створюємо клієнт для кожної можливої сесії
-                client = TelegramClient(session_name, account['api_id'], account['api_hash'])
-                
-                # Підключаємося щоб перевірити стан
-                await client.connect()
-                
-                if await client.is_user_authorized():
-                    logger.info(f"🔌 Відключаємо авторизований клієнт: {session_name}")
-                    await client.disconnect()
-                    disconnected_any = True
-                    logger.info(f"✅ Клієнт {session_name} успішно відключений")
-                else:
-                    await client.disconnect()
-                    logger.info(f"ℹ️ Клієнт {session_name} не авторизований")
-                    
-            except Exception as session_error:
-                logger.warning(f"⚠️ Помилка при роботі з сесією {session_name}: {session_error}")
-                continue
-        
-        if disconnected_any:
-            logger.info(f"✅ Відключено активні сесії для аккаунта {account_phone}")
-            return True
-        else:
-            logger.info(f"ℹ️ Не знайдено активних сесій для аккаунта {account_phone}")
-            return True  # Повертаємо True, оскільки мета досягнута - немає активних з'єднань
+        if account_phone in active_clients:
+            client = active_clients[account_phone]
+            logger.info(f"🔌 Знайдено активний клієнт в реєстрі для аккаунта {account_phone}")
             
+            try:
+                # Безпечне відключення з обробкою винятків
+                if hasattr(client, 'is_connected') and client.is_connected():
+                    logger.info(f"🔌 Відключаємо активний клієнт...")
+                    
+                    # Спробуємо швидке відключення
+                    disconnect_task = asyncio.create_task(client.disconnect())
+                    try:
+                        await asyncio.wait_for(disconnect_task, timeout=3.0)
+                        logger.info(f"✅ Швидке відключення клієнта успішне")
+                        disconnected_any = True
+                    except asyncio.TimeoutError:
+                        logger.warning(f"⚠️ Таймаут швидкого відключення, скасовуємо задачу...")
+                        disconnect_task.cancel()
+                        try:
+                            await disconnect_task
+                        except asyncio.CancelledError:
+                            pass
+                        
+                        # Примусове відключення
+                        try:
+                            if hasattr(client, '_disconnect'):
+                                await client._disconnect()
+                            logger.warning(f"⚠️ Примусове відключення виконано")
+                            disconnected_any = True
+                        except:
+                            logger.warning(f"⚠️ Примусове відключення не вдалося")
+                
+            except Exception as e:
+                logger.warning(f"⚠️ Помилка при відключенні клієнта з реєстру: {e}")
+            finally:
+                # Завжди видаляємо з реєстру незалежно від результату
+                unregister_active_client(account_phone)
+                logger.info(f"📋 Клієнт {account_phone} видалений з реєстру")
+        
+        # Перевіряємо і відключаємо клієнт через database.py
+        try:
+            existing_client = db.get_client(account_phone) if hasattr(db, 'get_client') else None
+            if existing_client:
+                logger.info(f"🔌 Знайдено клієнт через DB для аккаунта {account_phone}")
+                
+                if hasattr(existing_client, 'is_connected') and existing_client.is_connected():
+                    disconnect_task = asyncio.create_task(existing_client.disconnect())
+                    try:
+                        await asyncio.wait_for(disconnect_task, timeout=3.0)
+                        logger.info(f"✅ DB клієнт відключений")
+                        disconnected_any = True
+                    except asyncio.TimeoutError:
+                        logger.warning(f"⚠️ Таймаут відключення DB клієнта")
+                        disconnect_task.cancel()
+                        try:
+                            await disconnect_task
+                        except asyncio.CancelledError:
+                            pass
+        except Exception as e:
+            logger.warning(f"⚠️ Помилка при роботі з DB клієнтом: {e}")
+        
+        logger.info(f"✅ Відключення клієнта {account_phone} завершено. Статус: {'успішно' if disconnected_any else 'немає активних з\'єднань'}")
+        return True  # Завжди повертаємо True, оскільки мета досягнута
+        
     except Exception as e:
-        logger.error(f"❌ Помилка при відключенні клієнта для аккаунта {account_phone}: {e}")
+        logger.error(f"❌ Критична помилка при відключенні клієнта {account_phone}: {e}")
+        # Навіть при помилці видаляємо з реєстру
+        try:
+            unregister_active_client(account_phone)
+        except:
+            pass
         return False
 
 # Глобальні змінні (будуть імпортовані з основного файлу)
@@ -220,15 +181,182 @@ def unregister_active_client(account_phone: str):
 async def disconnect_all_active_clients():
     """Відключити всі активні клієнти"""
     global active_clients
-    for account_phone, client in list(active_clients.items()):
+    
+    logger.info(f"🔌 Починаємо відключення всіх активних клієнтів ({len(active_clients)} клієнтів)")
+    
+    # Створюємо копію щоб уникнути зміни словника під час ітерації
+    clients_copy = dict(active_clients)
+    
+    for account_phone, client in clients_copy.items():
         try:
-            if client.is_connected():
-                await client.disconnect()
-                logger.info(f"✅ Відключено активний клієнт для {account_phone}")
+            logger.info(f"🔌 Відключаємо клієнт для {account_phone}")
+            
+            if hasattr(client, 'is_connected') and client.is_connected():
+                # Швидке відключення з таймаутом
+                disconnect_task = asyncio.create_task(client.disconnect())
+                try:
+                    await asyncio.wait_for(disconnect_task, timeout=3.0)
+                    logger.info(f"✅ Клієнт {account_phone} відключений")
+                except asyncio.TimeoutError:
+                    logger.warning(f"⚠️ Таймаут відключення {account_phone}, скасовуємо...")
+                    disconnect_task.cancel()
+                    try:
+                        await disconnect_task
+                    except asyncio.CancelledError:
+                        pass
+                except Exception as disconnect_error:
+                    logger.warning(f"⚠️ Помилка відключення {account_phone}: {disconnect_error}")
+            else:
+                logger.info(f"ℹ️ Клієнт {account_phone} вже відключений")
+                
         except Exception as e:
-            logger.error(f"❌ Помилка відключення клієнта {account_phone}: {e}")
+            logger.error(f"❌ Помилка при обробці клієнта {account_phone}: {e}")
         finally:
+            # Завжди видаляємо з реєстру
             unregister_active_client(account_phone)
+    
+    logger.info("✅ Відключення всіх клієнтів завершено")
+
+async def cleanup_hanging_tasks():
+    """Очистити завислі задачі asyncio"""
+    try:
+        # Отримуємо поточну задачу щоб не скасувати саму себе
+        current_task = asyncio.current_task()
+        
+        # Отримуємо всі поточні задачі
+        all_tasks = asyncio.all_tasks()
+        current_tasks = [task for task in all_tasks if not task.done() and task != current_task]
+        
+        # Фільтруємо тільки Telethon задачі
+        telethon_tasks = []
+        for task in current_tasks:
+            task_name = str(task.get_coro())
+            if any(keyword in task_name for keyword in ['Connection', 'MTProtoSender', 'telethon']):
+                telethon_tasks.append(task)
+        
+        if telethon_tasks:
+            logger.info(f"🧹 Знайдено {len(telethon_tasks)} Telethon задач для очищення...")
+            
+            # Даємо задачам короткий час на завершення
+            await asyncio.sleep(0.5)
+            
+            # Скасовуємо тільки Telethon задачі
+            cancelled_count = 0
+            for task in telethon_tasks:
+                if not task.done() and not task.cancelled():
+                    try:
+                        task.cancel()
+                        cancelled_count += 1
+                        
+                        # Не чекаємо на завершення, просто скасовуємо
+                        try:
+                            await asyncio.wait_for(task, timeout=0.1)
+                        except (asyncio.CancelledError, asyncio.TimeoutError):
+                            pass
+                        except Exception:
+                            pass
+                            
+                    except Exception as e:
+                        logger.warning(f"⚠️ Помилка при скасуванні Telethon задачі: {e}")
+            
+            if cancelled_count > 0:
+                logger.info(f"✅ Скасовано {cancelled_count} Telethon задач")
+            else:
+                logger.info("✅ Всі Telethon задачі вже завершені")
+        else:
+            logger.info("ℹ️ Немає активних Telethon задач для очищення")
+            
+    except Exception as e:
+        logger.error(f"❌ Помилка при очищенні завислих задач: {e}")
+
+async def force_cleanup_all_sessions():
+    """Форсоване очищення всіх сесій Telethon"""
+    try:
+        logger.info("🧹 Починаємо форсоване очищення всіх сесій...")
+        
+        # Спочатку очищаємо реєстр активних клієнтів
+        global active_clients
+        if active_clients:
+            logger.info(f"📋 Очищаємо реєстр активних клієнтів ({len(active_clients)} клієнтів)")
+            active_clients.clear()
+        
+        # Знаходимо всі файли сесій
+        import os
+        import glob
+        
+        session_patterns = [
+            "session*.session",
+            "sessions/*.session",
+            "*.session"
+        ]
+        
+        session_files = []
+        for pattern in session_patterns:
+            session_files.extend(glob.glob(pattern))
+        
+        if session_files:
+            logger.info(f"📁 Знайдено {len(session_files)} файлів сесій для очищення")
+            
+            # Для кожного файлу сесії намагаємося створити клієнт і відключити
+            for session_file in session_files:
+                try:
+                    # Отримуємо ім'я сесії без розширення
+                    session_name = session_file.replace('.session', '')
+                    
+                    logger.info(f"🔍 Обробляємо сесію: {session_name}")
+                    
+                    # Спробуємо знайти відповідний аккаунт в базі
+                    accounts = db.get_accounts()
+                    matching_account = None
+                    
+                    for account in accounts:
+                        phone = account['phone_number'].replace('+', '').replace('-', '')
+                        if phone in session_name or session_name.endswith(phone):
+                            matching_account = account
+                            break
+                    
+                    if matching_account:
+                        try:
+                            # Створюємо тимчасовий клієнт для відключення
+                            temp_client = TelegramClient(
+                                session_name, 
+                                matching_account['api_id'], 
+                                matching_account['api_hash']
+                            )
+                            
+                            # Швидке підключення та відключення
+                            connect_task = asyncio.create_task(temp_client.connect())
+                            try:
+                                await asyncio.wait_for(connect_task, timeout=2.0)
+                                
+                                if await temp_client.is_user_authorized():
+                                    disconnect_task = asyncio.create_task(temp_client.disconnect())
+                                    try:
+                                        await asyncio.wait_for(disconnect_task, timeout=2.0)
+                                        logger.info(f"✅ Сесія {session_name} відключена")
+                                    except asyncio.TimeoutError:
+                                        disconnect_task.cancel()
+                                        logger.warning(f"⚠️ Таймаут відключення {session_name}")
+                                else:
+                                    await temp_client.disconnect()
+                                    logger.info(f"ℹ️ Сесія {session_name} не авторизована")
+                                    
+                            except asyncio.TimeoutError:
+                                connect_task.cancel()
+                                logger.warning(f"⚠️ Таймаут підключення {session_name}")
+                                
+                        except Exception as client_error:
+                            logger.warning(f"⚠️ Помилка з клієнтом {session_name}: {client_error}")
+                    else:
+                        logger.info(f"ℹ️ Не знайдено аккаунт для сесії {session_name}")
+                        
+                except Exception as session_error:
+                    logger.warning(f"⚠️ Помилка обробки сесії {session_file}: {session_error}")
+        
+        logger.info("✅ Форсоване очищення сесій завершено")
+        
+    except Exception as e:
+        logger.error(f"❌ Помилка при форсованому очищенні сесій: {e}")
 
 def init_mass_broadcast_module(database, telegram_bot):
     """Ініціалізація модуля масової розсилки"""
