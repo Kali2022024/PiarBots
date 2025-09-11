@@ -86,6 +86,26 @@ class Database:
                 )
             """)
             
+            # Таблиця історії розсилок (детальна статистика)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS broadcast_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    broadcast_id INTEGER,
+                    account_phone TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    chat_title TEXT,
+                    message_type TEXT NOT NULL,
+                    message_text TEXT,
+                    file_path TEXT,
+                    file_id TEXT,
+                    success BOOLEAN NOT NULL,
+                    error_message TEXT,
+                    sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (account_phone) REFERENCES accounts (phone_number),
+                    FOREIGN KEY (broadcast_id) REFERENCES broadcast_status (id)
+                )
+            """)
+            
             # Таблиця налаштувань масової розсилки
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS mass_broadcast_settings (
@@ -419,7 +439,7 @@ class Database:
                 return False
         return False
 
-    async def send_message_with_retry(self, client, group_id: str, group_name: str, message_data, message_obj=None, max_retries: int = 3) -> bool:
+    async def send_message_with_retry(self, client, group_id: str, group_name: str, message_data, message_obj=None, max_retries: int = 3, broadcast_id: int = None, account_phone: str = None) -> bool:
         """Відправити повідомлення з retry логікою та перевіркою існування групи"""
         import time
         from utils import add_random_pause, simulate_typing, add_random_emoji_to_text, should_send_sticker, should_add_emoji_to_caption, should_send_sticker_with_media
@@ -597,6 +617,20 @@ class Database:
                         logger.error(f"❌ Неправильний формат повідомлення: {message_data}")
                         return False
                 
+                # Логуємо успішну відправку в історію
+                if broadcast_id and account_phone:
+                    self.add_broadcast_history(
+                        broadcast_id=broadcast_id,
+                        account_phone=account_phone,
+                        chat_id=group_id,
+                        chat_title=group_name,
+                        message_type=message_data.get('type', 'text'),
+                        message_text=message_data.get('text', ''),
+                        file_path=message_data.get('file_path'),
+                        file_id=message_data.get('file_id'),
+                        success=True
+                    )
+                
                 return True
                 
             except FloodWaitError as flood_error:
@@ -618,6 +652,21 @@ class Database:
                                            parse_mode='HTML')
                 except:
                     pass  # Якщо не вдалося відправити повідомлення в чат
+                
+                # Логуємо FloodWait в історію
+                if broadcast_id and account_phone:
+                    self.add_broadcast_history(
+                        broadcast_id=broadcast_id,
+                        account_phone=account_phone,
+                        chat_id=group_id,
+                        chat_title=group_name,
+                        message_type=message_data.get('type', 'text'),
+                        message_text=message_data.get('text', ''),
+                        file_path=message_data.get('file_path'),
+                        file_id=message_data.get('file_id'),
+                        success=False,
+                        error_message=f"FloodWait: {wait_time}s + random: {random_time}s = {total_wait}s"
+                    )
                 
                 await asyncio.sleep(total_wait)
                 continue
@@ -671,8 +720,36 @@ class Database:
                     continue
                 else:
                     logger.error(f"❌ Всі спроби вичерпано для групи {group_name} ({group_id}): {error_msg}")
+                    # Логуємо невдалу відправку в історію
+                    if broadcast_id and account_phone:
+                        self.add_broadcast_history(
+                            broadcast_id=broadcast_id,
+                            account_phone=account_phone,
+                            chat_id=group_id,
+                            chat_title=group_name,
+                            message_type=message_data.get('type', 'text'),
+                            message_text=message_data.get('text', ''),
+                            file_path=message_data.get('file_path'),
+                            file_id=message_data.get('file_id'),
+                            success=False,
+                            error_message=error_msg
+                        )
                     return False
         
+        # Логуємо невдалу відправку в історію (якщо всі спроби невдалі)
+        if broadcast_id and account_phone:
+            self.add_broadcast_history(
+                broadcast_id=broadcast_id,
+                account_phone=account_phone,
+                chat_id=group_id,
+                chat_title=group_name,
+                message_type=message_data.get('type', 'text'),
+                message_text=message_data.get('text', ''),
+                file_path=message_data.get('file_path'),
+                file_id=message_data.get('file_id'),
+                success=False,
+                error_message="Всі спроби відправки невдалі"
+            )
         return False
     
     def get_groups_for_account(self, account_phone: str) -> list:
@@ -1221,4 +1298,138 @@ class Database:
                 return cursor.rowcount > 0
         except Exception as e:
             logger.error(f"❌ Помилка при видаленні шаблону: {e}")
+            return False
+    
+    def add_broadcast_history(self, broadcast_id: int, account_phone: str, chat_id: str, 
+                            chat_title: str, message_type: str, message_text: str = None,
+                            file_path: str = None, file_id: str = None, success: bool = True,
+                            error_message: str = None) -> bool:
+        """Додати запис в історію розсилок"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO broadcast_history 
+                    (broadcast_id, account_phone, chat_id, chat_title, message_type, 
+                     message_text, file_path, file_id, success, error_message)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (broadcast_id, account_phone, chat_id, chat_title, message_type,
+                      message_text, file_path, file_id, success, error_message))
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"❌ Помилка при додаванні в історію розсилок: {e}")
+            return False
+    
+    def get_broadcast_history(self, limit: int = 1000) -> list:
+        """Отримати історію розсилок"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT h.*, a.first_name, a.last_name, a.username
+                    FROM broadcast_history h
+                    LEFT JOIN accounts a ON h.account_phone = a.phone_number
+                    ORDER BY h.sent_at DESC
+                    LIMIT ?
+                """, (limit,))
+                return cursor.fetchall()
+        except Exception as e:
+            logger.error(f"❌ Помилка при отриманні історії розсилок: {e}")
+            return []
+    
+    def get_broadcast_statistics(self) -> dict:
+        """Отримати статистику розсилок"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                # Загальна статистика
+                cursor.execute("""
+                    SELECT 
+                        COUNT(*) as total_sends,
+                        SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as successful_sends,
+                        SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) as failed_sends,
+                        COUNT(DISTINCT chat_id) as unique_chats,
+                        COUNT(DISTINCT account_phone) as unique_accounts
+                    FROM broadcast_history
+                """)
+                stats = cursor.fetchone()
+                
+                # Статистика по аккаунтах
+                cursor.execute("""
+                    SELECT 
+                        h.account_phone,
+                        a.first_name,
+                        a.last_name,
+                        COUNT(*) as total_sends,
+                        SUM(CASE WHEN h.success = 1 THEN 1 ELSE 0 END) as successful_sends,
+                        SUM(CASE WHEN h.success = 0 THEN 1 ELSE 0 END) as failed_sends
+                    FROM broadcast_history h
+                    LEFT JOIN accounts a ON h.account_phone = a.phone_number
+                    GROUP BY h.account_phone, a.first_name, a.last_name
+                    ORDER BY total_sends DESC
+                """)
+                account_stats = cursor.fetchall()
+                
+                # Статистика по чатах
+                cursor.execute("""
+                    SELECT 
+                        chat_id,
+                        chat_title,
+                        COUNT(*) as total_sends,
+                        SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as successful_sends,
+                        SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) as failed_sends
+                    FROM broadcast_history
+                    GROUP BY chat_id, chat_title
+                    ORDER BY total_sends DESC
+                    LIMIT 20
+                """)
+                chat_stats = cursor.fetchall()
+                
+                # Статистика проблемних аккаунтів (FloodWait)
+                cursor.execute("""
+                    SELECT 
+                        account_phone,
+                        COUNT(*) as floodwait_count,
+                        MAX(sent_at) as last_floodwait
+                    FROM broadcast_history 
+                    WHERE success = 0 AND error_message LIKE '%FloodWait%'
+                    GROUP BY account_phone
+                    ORDER BY floodwait_count DESC
+                """)
+                floodwait_stats = cursor.fetchall()
+                
+                return {
+                    'total': {
+                        'total_sends': stats[0] or 0,
+                        'successful_sends': stats[1] or 0,
+                        'failed_sends': stats[2] or 0,
+                        'unique_chats': stats[3] or 0,
+                        'unique_accounts': stats[4] or 0
+                    },
+                    'by_accounts': account_stats,
+                    'by_chats': chat_stats,
+                    'floodwait_accounts': floodwait_stats
+                }
+        except Exception as e:
+            logger.error(f"❌ Помилка при отриманні статистики розсилок: {e}")
+            return {
+                'total': {'total_sends': 0, 'successful_sends': 0, 'failed_sends': 0, 'unique_chats': 0, 'unique_accounts': 0},
+                'by_accounts': [],
+                'by_chats': [],
+                'floodwait_accounts': []
+            }
+    
+    def clear_broadcast_history(self) -> bool:
+        """Очистити історію розсилок"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM broadcast_history")
+                conn.commit()
+                logger.info("✅ Історія розсилок очищена")
+                return True
+        except Exception as e:
+            logger.error(f"❌ Помилка при очищенні історії розсилок: {e}")
             return False

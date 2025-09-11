@@ -19,8 +19,63 @@ logger = logging.getLogger(__name__)
 # Створюємо роутер для масової розсилки
 router = Router()
 
+# Глобальний реєстр зупинених аккаунтів
+stopped_accounts = set()
+
+def stop_account_broadcast(account_phone: str):
+    """Додати аккаунт до списку зупинених"""
+    global stopped_accounts
+    stopped_accounts.add(account_phone)
+    logger.info(f"🛑 Аккаунт {account_phone} додано до списку зупинених: {stopped_accounts}")
+
+def resume_account_broadcast(account_phone: str):
+    """Видалити аккаунт зі списку зупинених"""
+    global stopped_accounts
+    stopped_accounts.discard(account_phone)
+    logger.info(f"▶️ Аккаунт {account_phone} видалено зі списку зупинених: {stopped_accounts}")
+
+def is_account_stopped(account_phone: str) -> bool:
+    """Перевірити чи аккаунт зупинений"""
+    global stopped_accounts
+    return account_phone in stopped_accounts
+
+async def is_broadcast_stopped(state: FSMContext, account_phone: str = None):
+    """Перевіряє чи потрібно зупинити розсилку (загальну або для конкретного аккаунта)"""
+    # Перевіряємо зупинку конкретного аккаунта через глобальну змінну
+    if account_phone and is_account_stopped(account_phone):
+        logger.info(f"🔍 DEBUG: is_broadcast_stopped - ЗУПИНКА для аккаунта {account_phone} (глобальна змінна)")
+        return True
+    
+    if not state:
+        logger.info(f"🔍 DEBUG: is_broadcast_stopped - немає state")
+        return False
+    
+    data = await state.get_data()
+    
+    # Перевіряємо загальну зупинку
+    if data.get('stop_broadcast', False):
+        logger.info(f"🔍 DEBUG: is_broadcast_stopped - загальна зупинка активна")
+        return True
+    
+    # Перевіряємо зупинку конкретного аккаунта через FSM (додатково)
+    stop_account = data.get('stop_broadcast_account')
+    logger.info(f"🔍 DEBUG: is_broadcast_stopped - account_phone={account_phone}, stop_broadcast_account={stop_account}")
+    
+    if account_phone and stop_account == account_phone:
+        logger.info(f"🔍 DEBUG: is_broadcast_stopped - ЗУПИНКА для аккаунта {account_phone} (FSM)")
+        return True
+    
+    return False
+
 async def handle_stop_message_command(message: Message, state: FSMContext):
     """Обробка команди /stop_message - зупинка всіх розсилок"""
+    logger.info(f"🔧 DEBUG: Зупиняємо ВСІ розсилки (handle_stop_message_command)")
+    
+    # Очищаємо список зупинених аккаунтів
+    global stopped_accounts
+    stopped_accounts.clear()
+    logger.info(f"🔄 Очистили список зупинених аккаунтів")
+    
     # Зупиняємо всі розсилки
     await state.update_data(stop_broadcast=True)
     
@@ -93,31 +148,30 @@ async def disconnect_account_client(account_phone: str) -> bool:
                 if hasattr(client, 'is_connected') and client.is_connected():
                     logger.info(f"🔌 Відключаємо активний клієнт...")
                     
-                    # Спробуємо швидке відключення
-                    disconnect_task = asyncio.create_task(client.disconnect())
+                    # Спробуємо швидке відключення без asyncio.shield
                     try:
-                        await asyncio.wait_for(disconnect_task, timeout=3.0)
+                        # Простий виклик disconnect без обгортання в task
+                        await asyncio.wait_for(client.disconnect(), timeout=3.0)
                         logger.info(f"✅ Швидке відключення клієнта успішне")
                         disconnected_any = True
                     except asyncio.TimeoutError:
-                        logger.warning(f"⚠️ Таймаут швидкого відключення, скасовуємо задачу...")
-                        disconnect_task.cancel()
-                        try:
-                            await disconnect_task
-                        except asyncio.CancelledError:
-                            pass
+                        logger.warning(f"⚠️ Таймаут швидкого відключення...")
                         
                         # Примусове відключення
                         try:
                             if hasattr(client, '_disconnect'):
-                                await client._disconnect()
+                                await asyncio.wait_for(client._disconnect(), timeout=1.0)
                             logger.warning(f"⚠️ Примусове відключення виконано")
                             disconnected_any = True
-                        except:
-                            logger.warning(f"⚠️ Примусове відключення не вдалося")
+                        except Exception as force_e:
+                            logger.warning(f"⚠️ Примусове відключення не вдалося: {force_e}")
                 
             except Exception as e:
                 logger.warning(f"⚠️ Помилка при відключенні клієнта з реєстру: {e}")
+                # Перевіряємо чи це критична помилка підключення
+                if "GeneratorExit" in str(e) or "Task was destroyed" in str(e) or "coroutine ignored" in str(e):
+                    logger.error(f"🔴 Критична помилка підключення для {account_phone}: аккаунт не працює")
+                    # Можна додати повідомлення користувачу про проблемний аккаунт
             finally:
                 # Завжди видаляємо з реєстру незалежно від результату
                 unregister_active_client(account_phone)
@@ -130,23 +184,38 @@ async def disconnect_account_client(account_phone: str) -> bool:
                 logger.info(f"🔌 Знайдено клієнт через DB для аккаунта {account_phone}")
                 
                 if hasattr(existing_client, 'is_connected') and existing_client.is_connected():
-                    disconnect_task = asyncio.create_task(existing_client.disconnect())
                     try:
-                        await asyncio.wait_for(disconnect_task, timeout=3.0)
+                        await asyncio.wait_for(existing_client.disconnect(), timeout=3.0)
                         logger.info(f"✅ DB клієнт відключений")
                         disconnected_any = True
                     except asyncio.TimeoutError:
                         logger.warning(f"⚠️ Таймаут відключення DB клієнта")
-                        disconnect_task.cancel()
+                        # Примусове відключення для DB клієнта
                         try:
-                            await disconnect_task
-                        except asyncio.CancelledError:
-                            pass
+                            if hasattr(existing_client, '_disconnect'):
+                                await asyncio.wait_for(existing_client._disconnect(), timeout=1.0)
+                                logger.warning(f"⚠️ Примусове відключення DB клієнта виконано")
+                                disconnected_any = True
+                        except Exception as db_force_e:
+                            logger.warning(f"⚠️ Примусове відключення DB клієнта не вдалося: {db_force_e}")
         except Exception as e:
             logger.warning(f"⚠️ Помилка при роботі з DB клієнтом: {e}")
         
-        logger.info(f"✅ Відключення клієнта {account_phone} завершено. Статус: {'успішно' if disconnected_any else 'немає активних з\'єднань'}")
-        return True  # Завжди повертаємо True, оскільки мета досягнута
+        result_message = f"✅ Відключення клієнта {account_phone} завершено. Статус: {'успішно' if disconnected_any else 'немає активних з\'єднань'}"
+        logger.info(result_message)
+        
+        # Перевіряємо чи клієнт дійсно відключений
+        final_check = True
+        try:
+            if account_phone in active_clients:
+                client = active_clients[account_phone]
+                if hasattr(client, 'is_connected') and client.is_connected():
+                    logger.warning(f"⚠️ Клієнт {account_phone} все ще підключений після спроб відключення!")
+                    final_check = False
+        except Exception as check_error:
+            logger.warning(f"⚠️ Помилка перевірки статусу клієнта {account_phone}: {check_error}")
+        
+        return disconnected_any or final_check
         
     except Exception as e:
         logger.error(f"❌ Критична помилка при відключенні клієнта {account_phone}: {e}")
@@ -178,6 +247,24 @@ def unregister_active_client(account_phone: str):
         del active_clients[account_phone]
         logger.info(f"📋 Видалено клієнт з реєстру для {account_phone}")
 
+def get_problematic_accounts() -> list:
+    """Отримати список проблемних аккаунтів"""
+    problematic_accounts = []
+    global active_clients
+    
+    for account_phone, client in active_clients.items():
+        try:
+            # Перевіряємо чи клієнт працює
+            if hasattr(client, 'is_connected'):
+                if not client.is_connected():
+                    problematic_accounts.append(account_phone)
+        except Exception as e:
+            # Якщо є помилка при перевірці - аккаунт проблемний
+            if "GeneratorExit" in str(e) or "Task was destroyed" in str(e) or "coroutine ignored" in str(e):
+                problematic_accounts.append(account_phone)
+    
+    return problematic_accounts
+
 async def disconnect_all_active_clients():
     """Відключити всі активні клієнти"""
     global active_clients
@@ -192,18 +279,19 @@ async def disconnect_all_active_clients():
             logger.info(f"🔌 Відключаємо клієнт для {account_phone}")
             
             if hasattr(client, 'is_connected') and client.is_connected():
-                # Швидке відключення з таймаутом
-                disconnect_task = asyncio.create_task(client.disconnect())
+                # Безпечне відключення без створення додаткових задач
                 try:
-                    await asyncio.wait_for(disconnect_task, timeout=3.0)
+                    await asyncio.wait_for(client.disconnect(), timeout=3.0)
                     logger.info(f"✅ Клієнт {account_phone} відключений")
                 except asyncio.TimeoutError:
-                    logger.warning(f"⚠️ Таймаут відключення {account_phone}, скасовуємо...")
-                    disconnect_task.cancel()
+                    logger.warning(f"⚠️ Таймаут відключення {account_phone}")
+                    # Примусове відключення
                     try:
-                        await disconnect_task
-                    except asyncio.CancelledError:
-                        pass
+                        if hasattr(client, '_disconnect'):
+                            await asyncio.wait_for(client._disconnect(), timeout=1.0)
+                            logger.warning(f"⚠️ Примусове відключення {account_phone} виконано")
+                    except Exception as force_error:
+                        logger.warning(f"⚠️ Примусове відключення {account_phone} не вдалося: {force_error}")
                 except Exception as disconnect_error:
                     logger.warning(f"⚠️ Помилка відключення {account_phone}: {disconnect_error}")
             else:
@@ -230,37 +318,45 @@ async def cleanup_hanging_tasks():
         # Фільтруємо тільки Telethon задачі
         telethon_tasks = []
         for task in current_tasks:
-            task_name = str(task.get_coro())
-            if any(keyword in task_name for keyword in ['Connection', 'MTProtoSender', 'telethon']):
-                telethon_tasks.append(task)
+            try:
+                task_name = str(task.get_coro())
+                if any(keyword in task_name for keyword in ['Connection', 'MTProtoSender', 'telethon', '_recv_loop', '_send_loop']):
+                    telethon_tasks.append(task)
+            except Exception:
+                # Якщо не можемо отримати назву, але це може бути Telethon задача
+                continue
         
         if telethon_tasks:
             logger.info(f"🧹 Знайдено {len(telethon_tasks)} Telethon задач для очищення...")
             
-            # Даємо задачам короткий час на завершення
-            await asyncio.sleep(0.5)
-            
-            # Скасовуємо тільки Telethon задачі
+            # Агресивне скасування всіх Telethon задач
             cancelled_count = 0
             for task in telethon_tasks:
                 if not task.done() and not task.cancelled():
                     try:
                         task.cancel()
                         cancelled_count += 1
-                        
-                        # Не чекаємо на завершення, просто скасовуємо
+                    except Exception as e:
+                        logger.warning(f"⚠️ Помилка при скасуванні задачі: {e}")
+            
+            # Даємо час на завершення скасування
+            if cancelled_count > 0:
+                logger.info(f"🔄 Скасовано {cancelled_count} Telethon задач, чекаємо завершення...")
+                await asyncio.sleep(1.0)
+                
+                # Перевіряємо чи залишилися незавершені задачі
+                remaining_tasks = [task for task in telethon_tasks if not task.done()]
+                if remaining_tasks:
+                    logger.warning(f"⚠️ Залишилося {len(remaining_tasks)} незавершених задач, примусове завершення...")
+                    # Примусове завершення
+                    for task in remaining_tasks:
                         try:
-                            await asyncio.wait_for(task, timeout=0.1)
-                        except (asyncio.CancelledError, asyncio.TimeoutError):
-                            pass
+                            if not task.done():
+                                task.cancel()
                         except Exception:
                             pass
-                            
-                    except Exception as e:
-                        logger.warning(f"⚠️ Помилка при скасуванні Telethon задачі: {e}")
-            
-            if cancelled_count > 0:
-                logger.info(f"✅ Скасовано {cancelled_count} Telethon задач")
+                
+                logger.info("✅ Очищення Telethon задач завершено")
             else:
                 logger.info("✅ Всі Telethon задачі вже завершені")
         else:
@@ -279,6 +375,35 @@ async def force_cleanup_all_sessions():
         if active_clients:
             logger.info(f"📋 Очищаємо реєстр активних клієнтів ({len(active_clients)} клієнтів)")
             active_clients.clear()
+        
+        # Додаткове очищення всіх asyncio задач
+        try:
+            all_tasks = asyncio.all_tasks()
+            current_task = asyncio.current_task()
+            telethon_tasks = []
+            
+            for task in all_tasks:
+                if task != current_task and not task.done():
+                    try:
+                        task_name = str(task.get_coro())
+                        if any(keyword in task_name for keyword in ['Connection', 'MTProtoSender', 'telethon', '_recv_loop', '_send_loop']):
+                            telethon_tasks.append(task)
+                    except Exception:
+                        continue
+            
+            if telethon_tasks:
+                logger.info(f"🔄 Примусове скасування {len(telethon_tasks)} Telethon задач...")
+                for task in telethon_tasks:
+                    try:
+                        task.cancel()
+                    except Exception:
+                        pass
+                
+                # Даємо час на завершення
+                await asyncio.sleep(0.5)
+                
+        except Exception as e:
+            logger.warning(f"⚠️ Помилка при додатковому очищенні задач: {e}")
         
         # Знаходимо всі файли сесій
         import os
@@ -454,6 +579,9 @@ async def process_media_file_common(message, message_type, phone, media_dir):
 @router.callback_query(lambda c: c.data == "Mass_broadcast")
 async def mass_broadcast_callback(callback: CallbackQuery, state: FSMContext):
     """Обробка натискання кнопки масової розсилки"""
+    # Очищаємо старі дані з попередніх сесій
+    await state.clear()
+    
     accounts = db.get_accounts()
     
     if not accounts:
@@ -487,6 +615,8 @@ async def mass_broadcast_callback(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(lambda c: c.data == "mass_one_message_for_all_accounts")
 async def mass_one_message_for_all_accounts_callback(callback: CallbackQuery, state: FSMContext):
     """Обробка натискання кнопки 1 повідомлення для всіх аккаунтів"""
+    # Очищаємо account_messages щоб вказати що це "одне повідомлення для всіх"
+    await state.update_data(account_messages={})
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📝 Текстове повідомлення", callback_data="one_message_type_text")],
         [InlineKeyboardButton(text="🖼️ Фото", callback_data="one_message_type_photo")],
@@ -586,36 +716,10 @@ async def process_mass_one_media_caption(message: Message, state: FSMContext):
         await show_remaining_accounts(message, state)
     else:
         # Це загальний підпис для масової розсилки
-        await state.update_data(text=caption)
+        # Підпис вже збережений в update_data(caption=caption) вище
         await show_interval_settings(message, state)
 
-@router.callback_query(lambda c: c.data in ["media_no_caption", "media_with_caption"])
-async def process_media_caption_callback(callback: CallbackQuery, state: FSMContext):
-    """Обробка вибору підпису для медіа"""
-    has_caption = callback.data == "media_with_caption"
-    data = await state.get_data()
-    message_type = data.get('message_type')
-    
-    # Зберігаємо інформацію про підпис
-    await state.update_data(has_caption=has_caption)
-    
-    media_type_names = get_media_type_names()
-
-    if has_caption:
-        await callback.message.answer(
-            f"📎 <b>Завантажте {media_type_names[message_type]} для аккаунта:</b>\n\n"
-            f"📝 Після завантаження файлу введіть підпис:",
-            parse_mode='HTML'
-        )
-    else:
-        await callback.message.answer(
-            f"📎 <b>Завантажте {media_type_names[message_type]} для аккаунта:</b>\n\n"
-            f"📎 Файл буде відправлено без підпису:",
-            parse_mode='HTML'
-        )
-    
-    await state.set_state(MassBroadcastStates.waiting_for_media_file)
-    await callback.answer()
+# Цей обробник був дублікатом, видалено
 
 
 
@@ -672,7 +776,11 @@ async def process_mass_broadcast_message(message: Message, state: FSMContext):
         # Зберігаємо текст повідомлення
         await state.update_data(message_text=message_text)
         data = await state.get_data()
-        is_one_message_for_all = not data.get('account_messages')
+        
+        # Перевіряємо чи це "одне повідомлення для всіх аккаунтів"
+        # Якщо account_messages порожній або відсутній, то це одне повідомлення для всіх
+        account_messages = data.get('account_messages', {})
+        is_one_message_for_all = not account_messages or len(account_messages) == 0
 
         if is_one_message_for_all:
             # Для одного повідомлення для всіх аккаунтів переходимо до налаштування інтервалів
@@ -736,13 +844,18 @@ async def process_mass_media_file(message: Message, state: FSMContext):
         'media_file_path': file_path,
         'media_file_id': file_id
     }
-
     
+    logger.info(f"💾 Зберігаємо медіа дані в FSM: {update_data}")
     await state.update_data(**update_data)
+    
+    # Перевірка збереження
+    check_data = await state.get_data()
+    logger.info(f"🔍 Перевірка збереження медіа: type={check_data.get('message_type')}, path={check_data.get('media_file_path')}, id={check_data.get('media_file_id')}")
     
     # Перевіряємо чи це повідомлення для всіх аккаунтів
     data = await state.get_data()
-    is_one_message_for_all = not data.get('account_messages')
+    account_messages = data.get('account_messages', {})
+    is_one_message_for_all = not account_messages or len(account_messages) == 0
     
     if is_one_message_for_all:
         # Для одного повідомлення для всіх аккаунтів переходимо до налаштування інтервалів
@@ -776,7 +889,7 @@ async def process_mass_media_caption_callback(callback: CallbackQuery, state: FS
     data = await state.get_data()
     message_type = data.get('message_type')
     
-# Зберігаємо інформацію про підпис
+    # Зберігаємо інформацію про підпис
     await state.update_data(has_caption=has_caption)
     
     media_type_names = get_media_type_names()
@@ -788,7 +901,8 @@ async def process_mass_media_caption_callback(callback: CallbackQuery, state: FS
        )
        await state.set_state(MassBroadcastStates.waiting_for_media_caption)
     else:
-      # Без підпису - переходимо до налаштування інтервалів
+      # Без підпису - зберігаємо порожній підпис і переходимо до налаштування інтервалів
+        await state.update_data(caption='')
         await show_interval_settings(callback, state)
     await callback.answer()
 
@@ -806,6 +920,9 @@ async def process_mass_media_caption(message: Message, state: FSMContext):
         await message.answer("❌ Підпис не може бути порожнім. Спробуйте ще раз:")
         return
     
+    # Зберігаємо підпис в FSM
+    await state.update_data(caption=caption)
+    
     if phone:
         # Це підпис для конкретного аккаунта
         # Зберігаємо повідомлення з підписом
@@ -820,7 +937,7 @@ async def process_mass_media_caption(message: Message, state: FSMContext):
         await show_remaining_accounts(message, state)
     else:
         # Це загальний підпис для масової розсилки
-        await state.update_data(text=caption)
+        # Підпис вже збережений в update_data(caption=caption) вище
         await show_interval_settings(message, state)
 
 @router.callback_query(lambda c: c.data in ["media_no_caption", "media_with_caption"])
@@ -830,6 +947,8 @@ async def process_media_caption_callback(callback: CallbackQuery, state: FSMCont
     data = await state.get_data()
     phone = data.get('selected_account_for_message')
     message_type = data.get('message_type')
+    
+    logger.info(f"🔍 process_media_caption_callback - phone={phone}, type={message_type}, caption={has_caption}")
     
     # Зберігаємо інформацію про підпис
     await state.update_data(has_caption=has_caption)
@@ -1037,6 +1156,12 @@ async def process_mass_account_message_callback(callback: CallbackQuery, state: 
         [InlineKeyboardButton(text="🔙 Назад", callback_data="mass_different_messages")]
     ])
     
+    # ✅ Встановлюємо правильний стан для вибору типу повідомлення
+    await state.set_state(MassBroadcastStates.waiting_for_message_type)
+    
+    print(f"🔵 DEBUG: Відправляємо клавіатуру для аккаунта {account_phone}")
+    print(f"🔵 DEBUG: Встановлено стан FSM: {await state.get_state()}")
+    
     await callback.message.answer(
         f"📱 <b>Налаштування повідомлення для аккаунта:</b>\n"
         f"📞 <b>Номер:</b> {account_phone}\n\n"
@@ -1046,23 +1171,29 @@ async def process_mass_account_message_callback(callback: CallbackQuery, state: 
     )
     await callback.answer()
 
-@router.callback_query(lambda c: c.data.startswith("message_type_"))
+@router.callback_query(lambda c: c.data.startswith("message_type_"), MassBroadcastStates.waiting_for_message_type)
 async def process_message_type_callback(callback: CallbackQuery, state: FSMContext):
     """Обробка вибору типу повідомлення"""
+    print(f"🔴 DEBUG: process_message_type_callback ВИКЛИКАНО! callback.data={callback.data}")
+    
     message_type = callback.data.replace("message_type_", "")
     data = await state.get_data()
     phone = data.get('selected_account_for_message')
+    
+    print(f"🔴 DEBUG: process_message_type_callback - type={message_type}, phone={phone}")
+    logger.info(f"🔍 process_message_type_callback - type={message_type}, phone={phone}")
     
     # Зберігаємо тип повідомлення
     await state.update_data(message_type=message_type)
     
     if message_type == "text":
-        # Для текстового повідомлення
+        # Для текстового повідомлення - просимо ввести текст без зміни стану
         await callback.message.answer(
             f"📝 <b>Введіть текст повідомлення для аккаунта {phone}:</b>",
             parse_mode='HTML'
         )
-        await state.set_state(MassBroadcastStates.waiting_for_account_message)
+        # НЕ змінюємо стан - залишаємо waiting_for_message_type
+        print(f"🟢 DEBUG: Очікуємо введення тексту для аккаунта {phone} (стан не змінюється)")
     elif message_type == "template":
         # Показуємо шаблони
         templates = template_manager.db.get_templates()
@@ -1091,40 +1222,53 @@ async def process_message_type_callback(callback: CallbackQuery, state: FSMConte
             reply_markup=keyboard
         )
         await state.set_state(MassBroadcastStates.waiting_for_media_file)
+        print(f"🟡 DEBUG: Встановлено стан для медіа")
     
+    print(f"🔵 DEBUG: Перед callback.answer()")
     await callback.answer()
+    print(f"🟢 DEBUG: Після callback.answer() - функція завершена успішно")
 
-@router.message(MassBroadcastStates.waiting_for_account_message)
-async def process_account_message(message: Message, state: FSMContext):
-    """Обробка повідомлення для конкретного аккаунта"""
+@router.message(MassBroadcastStates.waiting_for_message_type)
+async def process_account_text_input(message: Message, state: FSMContext):
+    """Обробка введення тексту для конкретного аккаунта"""
+    print(f"🚨 DEBUG: ========== process_account_text_input ENTRY POINT ==========")
+    print(f"🔵 DEBUG: process_account_text_input ВИКЛИКАНО! text={message.text}")
+    
+    # Перевіряємо чи це для окремого аккаунта
+    data = await state.get_data()
+    selected_account = data.get('selected_account_for_message')
+    message_type = data.get('message_type')
+    
+    if not selected_account:
+        print(f"🟡 DEBUG: Це не для окремого аккаунта, пропускаємо")
+        return
+    
+    if message_type != 'text':
+        print(f"🟡 DEBUG: Це не текстове повідомлення (type={message_type}), пропускаємо")
+        return
+    
+    print(f"🟢 DEBUG: Обробляємо текст для аккаунта {selected_account}")
+    current_state = await state.get_state()
+    print(f"🔍 DEBUG: Поточний стан в обробнику: {current_state}")
     text = message.text.strip()
     
     if not text:
         await message.answer("❌ Текст повідомлення не може бути порожнім. Спробуйте ще раз:")
         return
     
-    # Отримуємо поточний аккаунт
-    data = await state.get_data()
-    phone = data.get('selected_account_for_message')
+    print(f"🔵 DEBUG: Зберігаємо текст для аккаунта {selected_account}: {text}")
+    
+    # Зберігаємо повідомлення для цього аккаунта (як в шаблонах)
+    await save_account_message(state, selected_account, 'text', None, text)
+    
+    # Видаляємо поточний аккаунт зі списку (як в шаблонах)
     accounts_to_configure = data.get('accounts_to_configure', [])
-    
-    print(f"DEBUG: process_account_message - phone: {phone}")
-    print(f"DEBUG: process_account_message - text: {text}")
-    
-    if not phone:
-        await message.answer("❌ Помилка: немає поточного аккаунта.")
-        return
-    
-    # Зберігаємо повідомлення для цього аккаунта
-    await save_account_message(state, phone, 'text', None, text)
-    
-    # Видаляємо поточний аккаунт зі списку
-    accounts_to_configure = [acc for acc in accounts_to_configure if acc['phone_number'] != phone]
+    accounts_to_configure = [acc for acc in accounts_to_configure if acc['phone_number'] != selected_account]
     await state.update_data(accounts_to_configure=accounts_to_configure)
     
-    await message.answer(f"✅ Повідомлення для аккаунта {phone} збережено!")
+    await message.answer(f"✅ Текстове повідомлення для аккаунта {selected_account} збережено!")
     
-    # Показуємо наступний аккаунт або переходимо до налаштування інтервалів
+    # Показуємо наступний аккаунт або переходимо до налаштування інтервалів (як в шаблонах)
     await show_remaining_accounts(message, state)
 
 @router.message(MassBroadcastStates.waiting_for_media_file)
@@ -1309,14 +1453,40 @@ async def show_interval_settings(message_or_callback, state: FSMContext):
         [InlineKeyboardButton(text="🔙 Назад", callback_data="mass_different_messages" if account_messages else "Mass_broadcast")]
     ])
     
+    # Отримуємо медіа дані
+    message_type = data.get('message_type', '')
+    media_file_path = data.get('media_file_path', '')
+    has_caption = data.get('has_caption', False)
+    caption = data.get('caption', '')
+    
+    logger.info(f"🔍 show_interval_settings - медіа дані: type={message_type}, path={media_file_path}, caption={has_caption}, text={caption[:50] if caption else 'немає'}")
+    
     if account_messages:
         # Різні повідомлення
         message_info = f"📝 <b>Різні повідомлення для {len(account_messages)} аккаунтів</b>"
     elif template_name:
         # Шаблон
         message_info = f"📋 <b>Шаблон:</b> {template_name}\n💬 <b>Текст:</b> {message_text[:50]}{'...' if len(message_text) > 50 else ''}"
+    elif message_type and media_file_path:
+        # Медіа файл
+        media_type_names = {
+            'photo': 'фото',
+            'video': 'відео', 
+            'audio': 'аудіо',
+            'document': 'документ',
+            'animation': 'GIF',
+            'sticker': 'стікер',
+            'voice': 'голосове'
+        }
+        media_name = media_type_names.get(message_type, message_type)
+        file_name = os.path.basename(media_file_path) if media_file_path else 'медіа файл'
+        
+        if has_caption and caption:
+            message_info = f"📎 <b>{media_name.capitalize()}:</b> {file_name}\n💬 <b>Підпис:</b> {caption[:50]}{'...' if len(caption) > 50 else ''}"
+        else:
+            message_info = f"📎 <b>{media_name.capitalize()}:</b> {file_name}"
     else:
-        # Однакове повідомлення
+        # Текстове повідомлення
         message_info = f"📝 <b>Повідомлення:</b> {message_text[:50]}{'...' if len(message_text) > 50 else ''}"
     
     if hasattr(message_or_callback, 'message'):
@@ -1850,7 +2020,10 @@ async def send_text_message(account_phone: str, group_id: str, text: str):
             str(group_id), 
             f"Група {group_id}", 
             text,
-            None
+            None,
+            max_retries=3,
+            broadcast_id=0,  # Для тестових відправок
+            account_phone=account_phone
         )
         
         return success
@@ -2632,10 +2805,13 @@ async def mass_broadcast_process(message_text, interval: int, use_random: bool,
             # Перевіряємо флаг зупинки перед обробкою кожного аккаунта
             if state:
                 data = await state.get_data()
-                if data.get('stop_broadcast', False):
-                    logger.info("🛑 Отримано команду зупинки розсилки")
+                # Перевіряємо зупинку розсилки
+                if await is_broadcast_stopped(state, account_phone):
+                    logger.info(f"🛑 Отримано команду зупинки розсилки для аккаунта {account_phone}")
                     await message_obj.answer("🛑 Масову розсилку зупинено користувачем.")
                     return
+            
+            current_broadcast_id = 0  # Ініціалізуємо broadcast_id для кожного аккаунта
             
             try:
                 logger.info(f"📱 Обробляємо аккаунт: {account_phone} ({len(groups)} груп)")
@@ -2682,8 +2858,8 @@ async def mass_broadcast_process(message_text, interval: int, use_random: bool,
                         message_preview = message_text[:50] + "..." if len(message_text) > 50 else message_text
                     
                     # Встановлюємо статус running тільки для цього аккаунта
-                    db.set_broadcast_status(account_phone, message_preview, total_groups_for_account, 0, 0, 'running')
-                    logger.info(f"✅ Встановлено статус running для аккаунта {account_phone}")
+                    current_broadcast_id = db.set_broadcast_status(account_phone, message_preview, total_groups_for_account, 0, 0, 'running')
+                    logger.info(f"✅ Встановлено статус running для аккаунта {account_phone}, broadcast_id: {current_broadcast_id}")
                 except Exception as e:
                     logger.error(f"❌ Помилка при встановленні статусу running для {account_phone}: {e}")
                 
@@ -2717,15 +2893,30 @@ async def mass_broadcast_process(message_text, interval: int, use_random: bool,
                     # Перевіряємо флаг зупинки перед кожною групою
                     if state:
                         data = await state.get_data()
-                        if data.get('stop_broadcast', False):
-                            logger.info("🛑 Отримано команду зупинки розсилки")
+                        # Перевіряємо зупинку розсилки
+                        if await is_broadcast_stopped(state, account_phone):
+                            logger.info(f"🛑 Отримано команду зупинки розсилки для аккаунта {account_phone}")
                             await message_obj.answer("🛑 Масову розсилку зупинено користувачем.")
                             await client.disconnect()
                             return
                     
+                    # ДОДАТКОВА перевірка флагу зупинки перед обробкою кожної групи
+                    logger.info(f"🔍 DEBUG: Перевіряємо флаг зупинки перед групою для аккаунта {account_phone}")
+                    if await is_broadcast_stopped(state, account_phone):
+                        logger.info(f"🛑 Зупинку розсилки виявлено під час обробки груп для аккаунта {account_phone}")
+                        await client.disconnect()
+                        return
+                    logger.info(f"✅ DEBUG: Флаг зупинки НЕ встановлений, продовжуємо для аккаунта {account_phone}")
+                    
                     max_retries = 3
                     logger.info(f"📋 Обробляємо групу {j+1}/{len(groups)}: {group['name']} (ID: {group['group_id']})")
                     for attempt in range(max_retries):
+                        # Перевірка флагу зупинки перед кожною спробою відправки
+                        if await is_broadcast_stopped(state, account_phone):
+                            logger.info(f"🛑 Зупинку розсилки виявлено під час спроб відправки для аккаунта {account_phone}")
+                            await client.disconnect()
+                            return
+                        
                         try:
                             group_id = int(group['group_id'])
                             
@@ -2745,7 +2936,10 @@ async def mass_broadcast_process(message_text, interval: int, use_random: bool,
                                 str(group_id), 
                                 group['name'], 
                                 current_message,
-                                message_obj
+                                message_obj,
+                                max_retries=3,
+                                broadcast_id=current_broadcast_id or 0,
+                                account_phone=account_phone
                             )
                             
                             if success:
@@ -3114,6 +3308,8 @@ async def loop_broadcast_process(message_text, interval: int, use_random: bool,
                         await message_obj.answer("🛑 Циклічну розсилку зупинено користувачем.")
                         return
                 
+                current_broadcast_id = 0  # Ініціалізуємо broadcast_id для кожного аккаунта
+                
                 try:
                     logger.info(f"📱 Обробляємо аккаунт: {account_phone} ({len(groups)} груп)")
                     # Отримуємо дані аккаунта
@@ -3161,8 +3357,8 @@ async def loop_broadcast_process(message_text, interval: int, use_random: bool,
                                 message_preview = f"Циклічна розсилка ({msg_type})"
                         
                         # Встановлюємо статус running
-                        db.set_broadcast_status(account_phone, message_preview, total_groups, 0, 0, 'running')
-                        logger.info(f"✅ Встановлено статус running для аккаунта {account_phone}")
+                        current_broadcast_id = db.set_broadcast_status(account_phone, message_preview, total_groups, 0, 0, 'running')
+                        logger.info(f"✅ Встановлено статус running для аккаунта {account_phone}, broadcast_id: {current_broadcast_id}")
                     except Exception as e:
                         logger.error(f"❌ Помилка при встановленні статусу running для {account_phone}: {e}")
                     
@@ -3207,18 +3403,21 @@ async def loop_broadcast_process(message_text, interval: int, use_random: bool,
                     # Відправляємо повідомлення в групи цього аккаунта
                     logger.info(f"📤 Початок відправки повідомлень для аккаунта {account_phone}: {len(groups)} груп")
                     for j, group in enumerate(groups):
-                        # Перевіряємо флаг зупинки перед кожною групою
-                        if state:
-                            data = await state.get_data()
-                            if data.get('stop_broadcast', False):
-                                logger.info("🛑 Отримано команду зупинки розсилки")
-                                await message_obj.answer("🛑 Циклічну розсилку зупинено користувачем.")
-                                await client.disconnect()
-                                return
+                        # ДОДАТКОВА перевірка флагу зупинки перед обробкою кожної групи
+                        if await is_broadcast_stopped(state, account_phone):
+                            logger.info(f"🛑 Зупинку циклічної розсилки виявлено під час обробки груп для аккаунта {account_phone}")
+                            await client.disconnect()
+                            return
                         
                         max_retries = 3
                         logger.info(f"📋 Обробляємо групу {j+1}/{len(groups)}: {group['name']} (ID: {group['group_id']})")
                         for attempt in range(max_retries):
+                            # Перевірка флагу зупинки перед кожною спробою відправки
+                            if await is_broadcast_stopped(state, account_phone):
+                                logger.info(f"🛑 Зупинку циклічної розсилки виявлено під час спроб відправки для аккаунта {account_phone}")
+                                await client.disconnect()
+                                return
+                            
                             try:
                                 group_id = int(group['group_id'])
                                 
@@ -3238,7 +3437,10 @@ async def loop_broadcast_process(message_text, interval: int, use_random: bool,
                                     str(group_id), 
                                     group['name'], 
                                     current_message,
-                                    message_obj
+                                    message_obj,
+                                    max_retries=3,
+                                    broadcast_id=current_broadcast_id or 0,
+                                    account_phone=account_phone
                                 )
                                 
                                 if success:
@@ -3579,3 +3781,36 @@ async def back_to_templates_callback(callback: CallbackQuery, state: FSMContext)
             reply_markup=keyboard
         )
     await callback.answer()
+
+def suppress_telethon_errors():
+    """Придушити помилки Telethon при завершенні"""
+    import warnings
+    import sys
+    
+    # Придушуємо попередження про RuntimeError
+    warnings.filterwarnings("ignore", message=".*coroutine ignored GeneratorExit.*")
+    warnings.filterwarnings("ignore", message=".*Task was destroyed but it is pending.*")
+    
+    # Перенаправляємо stderr для Telethon помилок
+    original_stderr = sys.stderr
+    
+    class TelethonErrorFilter:
+        def __init__(self, original_stderr):
+            self.original_stderr = original_stderr
+            
+        def write(self, message):
+            # Фільтруємо Telethon помилки
+            if any(keyword in message for keyword in [
+                "RuntimeError: coroutine ignored GeneratorExit",
+                "Task was destroyed but it is pending",
+                "Exception ignored in: <coroutine object Connection._recv_loop",
+                "Exception ignored in: <coroutine object MTProtoSender._recv_loop"
+            ]):
+                return  # Не виводимо ці помилки
+            self.original_stderr.write(message)
+            
+        def flush(self):
+            self.original_stderr.flush()
+    
+    # Встановлюємо фільтр тільки для Telethon помилок
+    sys.stderr = TelethonErrorFilter(original_stderr)
